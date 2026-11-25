@@ -74,6 +74,41 @@ The route is resolved once and stored in a context-local value for the whole
 write burst. This avoids repeated health probes and prevents different writes
 from selecting inconsistent routes during the same event.
 
+## Coalescing and debounce
+
+Daemon mine jobs are keyed by source (`hook:mine:<mode>:<path>`). The queue
+keeps at most one *queued* job per key, next to at most one *running* job:
+
+- an event for a source that is already queued replaces that job's payload
+  (latest wins) and keeps its place in line;
+- an event for a source that is currently running queues one pending rerun,
+  so content that arrived mid-run is mined right after it, not at the next
+  hook.
+
+Each trigger has a settle window and a maximum wait. The job runs at
+`MIN(first_enqueued + max_wait, last_enqueued + settle)`; an immediate trigger
+is never delayed by a later debounced one.
+
+| Trigger      | Settle | Max wait |
+|--------------|--------|----------|
+| Stop         | 120 s  | 15 min   |
+| PreCompact   | 0      | 0        |
+| SessionEnd   | 0      | 0        |
+
+Override per trigger with `MEMPALACE_DAEMON_<TRIGGER>_SETTLE_SECONDS` /
+`MEMPALACE_DAEMON_<TRIGGER>_MAX_WAIT_SECONDS` (`STOP`, `PRECOMPACT`,
+`SESSION_END`), or in `config.json`:
+
+    {
+      "daemon": {
+        "debounce": {
+          "stop": {"settle_seconds": 120, "max_wait_seconds": 900}
+        }
+      }
+    }
+
+Diary checkpoints are never debounced.
+
 ## Submission ambiguity
 
 Once a daemon submission is attempted, an error never triggers direct

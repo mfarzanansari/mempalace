@@ -177,7 +177,7 @@ def test_submit_job_uses_client_and_waits(monkeypatch, tmp_path):
         def __init__(self):
             self.submitted = None
 
-        def submit(self, kind, payload, dedupe_key=None, priority=0):
+        def submit(self, kind, payload, dedupe_key=None, priority=0, **_debounce):
             self.submitted = (kind, payload, dedupe_key, priority)
             return {"id": "job-1", "state": "queued"}
 
@@ -1028,7 +1028,7 @@ def test_submit_job_forwards_stop_on_lock_deferral_to_wait(monkeypatch):
     seen = {}
 
     class _Client:
-        def submit(self, kind, payload, dedupe_key=None, priority=0):
+        def submit(self, kind, payload, dedupe_key=None, priority=0, **_debounce):
             return {"id": "job-1", "state": "queued"}
 
         def wait(self, job_id, *, timeout=None, stop_on_lock_deferral=False):
