@@ -172,6 +172,9 @@ def test_spawn_is_detached_and_skipped_while_a_daemon_is_alive(state, monkeypatc
     if os.name != "nt":
         assert kwargs["start_new_session"] is True
     assert kwargs["stdin"] is subprocess.DEVNULL
+    # A hook-started daemon exits when idle unless config says otherwise.
+    flag = argv.index("--idle-exit-default")
+    assert argv[flag + 1] == str(daemon_queue.AUTOSTART_IDLE_EXIT_MINUTES)
 
 
 def test_second_server_refuses_while_the_singleton_is_held(state):
@@ -234,3 +237,52 @@ def test_daemon_diary_job_writes_the_hook_ack_only_after_filing(tmp_path, monkey
     assert json.loads((tmp_path / "last_checkpoint").read_text())["msgs"] == 4
     markers = list(Path(tmp_path).glob("*_last_save"))
     assert [m.read_text() for m in markers] == ["9"]
+
+
+def _serve_in_thread(state, **kwargs):
+    import threading
+
+    errors: list = []
+
+    def _serve():
+        try:
+            daemon.run_server(state, port=0, **kwargs)
+        except BaseException as exc:  # noqa: BLE001 - surfaced to the test
+            errors.append(exc)
+
+    thread = threading.Thread(target=_serve, daemon=True)
+    thread.start()
+    return thread, errors
+
+
+def test_idle_daemon_exits_and_unregisters(state):
+    """With nothing queued or running, a daemon given an idle exit stops serving
+    and removes its registration, so the next hook starts a fresh one."""
+    thread, errors = _serve_in_thread(state, idle_exit_minutes=0.01)
+    thread.join(timeout=30)
+    assert not thread.is_alive(), "idle daemon kept serving"
+    assert not errors, errors
+    assert not daemon.endpoint_path(state).exists()
+    assert daemon_queue.daemon_registered_alive(state) is False
+
+
+def test_idle_exit_waits_for_queued_work(state, monkeypatch):
+    """A queued job -- even one still inside its debounce window -- keeps the
+    daemon up; it exits only after the queue drains."""
+    monkeypatch.setattr("mempalace.service.execute_job", lambda kind, payload: {"success": True})
+    runtime = daemon.DaemonRuntime(state)
+    runtime.store.enqueue("mine", {"source": "s"}, dedupe_key="k", settle_seconds=3600)
+    assert runtime.idle_seconds() == 0.0
+    job = runtime.store.claim_next()
+    assert job is None  # not due yet; still counted as pending work
+    assert runtime.idle_seconds() == 0.0
+
+
+def test_configured_idle_exit_overrides_the_autostart_default(state, monkeypatch):
+    monkeypatch.setenv("MEMPALACE_DAEMON_IDLE_EXIT_MINUTES", "0")
+    assert daemon._resolve_idle_exit_minutes(30) == 0.0
+    monkeypatch.setenv("MEMPALACE_DAEMON_IDLE_EXIT_MINUTES", "5")
+    assert daemon._resolve_idle_exit_minutes(30) == 5.0
+    monkeypatch.delenv("MEMPALACE_DAEMON_IDLE_EXIT_MINUTES")
+    assert daemon._resolve_idle_exit_minutes(30) == 30
+    assert daemon._resolve_idle_exit_minutes(None) == 0.0

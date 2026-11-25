@@ -71,6 +71,12 @@ Diary checkpoints are queued the same way. The daemon files the drawer and
 then writes the checkpoint ack and the session's save marker, so the marker
 still advances only once the entry is really stored.
 
+A daemon a hook started exits after 30 minutes with nothing running or queued
+(a debounced job not yet due counts as queued), and the next hook starts it
+again. `mempalace daemon start` keeps running unless configured:
+
+    MEMPALACE_DAEMON_IDLE_EXIT_MINUTES=30  # or daemon.idle_exit_minutes; 0 = never
+
 ### Where a daemon mine runs
 
 The daemon is the palace's only writer. A mine job's compute (reading files,
