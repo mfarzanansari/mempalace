@@ -8,7 +8,7 @@ so those land between the mine's calls rather than after the whole mine.
 
 Every message from the child is a heartbeat (``MineChild.last_progress``); the
 child can be killed from another thread (``MineChild.kill``) without taking
-the daemon down, which an in-process mine cannot offer (#2917).
+the daemon down, which an in-process mine cannot offer.
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ def _child_env(palace_path: str, threads: int) -> dict:
     env["MEMPALACE_PALACE_PATH"] = palace_path
     # Background mining: a couple of intra-op threads cost far less CPU per
     # row than the default pool (0.108 CPU-s/row at 1 thread, 0.41 at 8 in the
-    # #3058 measurements), and spinning threads burn idle cores for nothing.
+    # measurements behind this default), and spinning threads burn idle cores for nothing.
     if threads > 0 and "MEMPALACE_EMBEDDING_THREADS" not in os.environ:
         env["MEMPALACE_EMBEDDING_THREADS"] = str(threads)
     env.setdefault("MEMPALACE_ORT_ALLOW_SPINNING", "0")
@@ -157,7 +157,7 @@ def run_mine_in_child(
     A reaper thread kills the child when it goes ``stall_seconds`` without a
     message (requests and its heartbeat both count; time the daemon spends
     serving a call does not), and the caller kills one that reported done but
-    is still running ``exit_grace_seconds`` later (#2917). Either way the job
+    is still running ``exit_grace_seconds`` later. Either way the job
     fails and the daemon carries on; writes already made stay, and the next
     mine picks up where this one stopped.
 
@@ -239,7 +239,7 @@ def run_mine_in_child(
         try:
             proc.wait(timeout=exit_grace_seconds)
         except subprocess.TimeoutExpired:
-            # Reported done (or lost its channel) but did not exit (#2917).
+            # Reported done (or lost its channel) but did not exit.
             child.kill(f"did not exit {exit_grace_seconds:g} s after its channel closed")
             proc.wait()
     output = child.output()
