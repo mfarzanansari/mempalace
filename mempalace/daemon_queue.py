@@ -515,6 +515,7 @@ class QueueStore:
         *,
         exclude: set[str] | None = None,
         kinds: tuple[str, ...] | None = None,
+        exclude_kinds: tuple[str, ...] | None = None,
     ) -> Job | None:
         # Atomic across processes: the UPDATE only fires if the row is still
         # 'queued'. If two daemon processes SELECT the same row, the first to
@@ -551,13 +552,17 @@ class QueueStore:
         # passed, and only while no job of the same dedupe key is running: the
         # pending rerun waits for the run it follows, so one source is never
         # processed twice at once. ``kinds`` restricts a lane (the diary lane
-        # claims only ``diary_write``).
+        # claims only ``diary_write``); ``exclude_kinds`` keeps the main lane off
+        # them.
         exclude = exclude or set()
         kind_sql = ""
         kind_params: tuple = ()
         if kinds:
             kind_sql = f"AND kind IN ({', '.join('?' for _ in kinds)})"
             kind_params = tuple(kinds)
+        if exclude_kinds:
+            kind_sql += f" AND kind NOT IN ({', '.join('?' for _ in exclude_kinds)})"
+            kind_params += tuple(exclude_kinds)
         with self._lock, self._connect() as conn:
             now = float(self.clock())
             # Only the ids: the rows being skipped are here to be discarded, and

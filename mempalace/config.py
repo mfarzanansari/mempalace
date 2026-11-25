@@ -1783,6 +1783,41 @@ class MempalaceConfig:
         parsed = parse_bool(value) if isinstance(value, (bool, str)) else None
         return True if parsed is None else parsed
 
+    def _daemon_section(self) -> dict:
+        daemon = self._file_config.get("daemon", {})
+        return daemon if isinstance(daemon, dict) else {}
+
+    @property
+    def daemon_mine_child(self) -> bool:
+        """Whether the daemon runs mine jobs in an idle-priority child process.
+
+        Env ``MEMPALACE_DAEMON_MINE_CHILD`` > config ``daemon.mine_child`` > on.
+        Off runs mines on the daemon's own worker thread, as before.
+        """
+        flag = env_flag("MEMPALACE_DAEMON_MINE_CHILD")
+        if flag is not None:
+            return flag
+        value = self._daemon_section().get("mine_child", True)
+        parsed = parse_bool(value) if isinstance(value, (bool, str)) else None
+        return True if parsed is None else parsed
+
+    @property
+    def daemon_mine_threads(self) -> int:
+        """ONNX Runtime intra-op threads for the daemon's mine child.
+
+        Env ``MEMPALACE_DAEMON_MINE_THREADS`` > config ``daemon.mine_threads``
+        > 2. A background mine on few threads spends far less CPU per drawer
+        than one on every core. ``0`` leaves the general
+        ``embedding_threads`` setting in charge.
+        """
+        raw = os.environ.get("MEMPALACE_DAEMON_MINE_THREADS")
+        if raw is None:
+            raw = self._daemon_section().get("mine_threads", 2)
+        try:
+            return max(0, int(str(raw).strip()))
+        except (TypeError, ValueError):
+            return 2
+
     @property
     def hook_use_daemon(self):
         """Whether hooks should submit save/mine work to the opt-in daemon."""
