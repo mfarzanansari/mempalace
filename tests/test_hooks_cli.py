@@ -1011,6 +1011,7 @@ def test_save_diary_direct_daemon_opt_in_queues_job_without_waiting(tmp_path):
     assert job.payload["agent_name"] == "claude"
     assert job.payload["wing"] == "wing_project"
     assert job.payload["topic"] == "checkpoint"
+    assert job.payload["idempotency_key"]
     assert job.payload["hook_ack"]["exchange_count"] == 7
     assert job.payload["hook_ack"]["session_id"] == "sess1"
 

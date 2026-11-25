@@ -58,7 +58,7 @@ def test_hook_daemon_enqueue_imports_no_storage_stack_and_fits_the_budget(tmp_pa
         t0 = time.perf_counter()
         from mempalace import daemon_queue, hooks_cli
         spawned = []
-        daemon_queue.subprocess.Popen = lambda *a, **k: spawned.append(a)
+        daemon_queue.subprocess.Popen = lambda *a, **k: (spawned.append(a) or __import__("types").SimpleNamespace(pid=1))
         with hooks_cli._hook_trigger("stop"), hooks_cli._hook_write_routing_context() as r:
             job = hooks_cli._submit_daemon_job(
                 "mine", {{"source": "/x", "mode": "convos"}}, dedupe_key="k"
@@ -159,11 +159,12 @@ def state(tmp_path, monkeypatch):
 
 def test_spawn_is_detached_and_skipped_while_a_daemon_is_alive(state, monkeypatch):
     with patch.object(daemon_queue.subprocess, "Popen") as popen:
-        monkeypatch.setattr(daemon_queue, "daemon_registered_alive", lambda _p: True)
+        popen.return_value.pid = os.getpid()
+        monkeypatch.setattr(daemon_queue, "daemon_lock_held", lambda _p: True)
         assert daemon_queue.spawn_daemon_detached(state) is False
         popen.assert_not_called()
 
-        monkeypatch.setattr(daemon_queue, "daemon_registered_alive", lambda _p: False)
+        monkeypatch.setattr(daemon_queue, "daemon_lock_held", lambda _p: False)
         assert daemon_queue.spawn_daemon_detached(state) is True
         assert daemon_queue.spawn_daemon_detached(state) is False, "throttled while it comes up"
     popen.assert_called_once()
@@ -328,3 +329,166 @@ def test_run_server_records_a_refused_start(state, monkeypatch):
     with pytest.raises(daemon.DaemonError, match="startup refused"):
         daemon.run_server(state)
     assert daemon_queue.start_recently_refused(state) is True
+
+
+def test_hook_enqueues_after_healthy_daemon_finishes_idle_handoff(state, monkeypatch):
+    import threading
+
+    exit_allowed = threading.Event()
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", state)
+    monkeypatch.setenv("MEMPALACE_HOOK_WRITE_ROUTING", "require")
+    monkeypatch.setenv("MEMPALACE_HOOK_DAEMON_AUTOSTART", "1")
+    monkeypatch.setattr(
+        daemon.DaemonRuntime, "idle_seconds", lambda self: float(exit_allowed.is_set())
+    )
+    thread, errors = _serve_in_thread(state, idle_exit_minutes=0.01)
+    try:
+        deadline = time.monotonic() + 15
+        while not daemon_queue.probe_daemon_health(state) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        with hooks_cli._hook_write_routing_context() as route:
+            assert route.decision.reason == "daemon-available"
+            exit_allowed.set()
+            thread.join(10)
+            assert not thread.is_alive() and not errors
+            with patch.object(daemon_queue.subprocess, "Popen") as spawn:
+                job = hooks_cli._submit_daemon_job("mine", {"source": "x"})
+                assert job["state"] == "queued"
+                spawn.assert_called_once()
+    finally:
+        exit_allowed.set()
+        thread.join(10)
+
+
+def test_failed_spawn_does_not_throttle_the_next_hook(state):
+    with patch.object(daemon_queue.subprocess, "Popen", side_effect=OSError("spawn failed")):
+        with pytest.raises(OSError):
+            daemon_queue.spawn_daemon_detached(state)
+    with patch.object(daemon_queue.subprocess, "Popen"):
+        assert daemon_queue.spawn_daemon_detached(state)
+
+
+def test_other_hooks_do_not_spawn_while_launcher_is_in_popen(state):
+    from types import SimpleNamespace
+
+    spawned = []
+
+    def launch(*args, **kwargs):
+        spawned.append(True)
+        if len(spawned) == 1:
+            # Even a delayed launch must exclude a contender past the usual throttle.
+            with patch.object(daemon_queue, "SPAWN_THROTTLE_SECONDS", 0):
+                daemon_queue.spawn_daemon_detached(state)
+        return SimpleNamespace(pid=os.getpid())
+
+    with patch.object(daemon_queue.subprocess, "Popen", launch):
+        assert daemon_queue.spawn_daemon_detached(state)
+    assert len(spawned) == 1
+
+
+@pytest.mark.parametrize("entry", ["short entry", "longer entry " * 60])
+def test_replaying_a_hook_checkpoint_preserves_the_original_drawers(
+    tmp_path, monkeypatch, collection, entry
+):
+    from mempalace import mcp_server, service
+
+    monkeypatch.setattr(mcp_server, "_get_collection", lambda **_: collection)
+    monkeypatch.setattr(type(mcp_server._config), "chunk_size", property(lambda self: 100))
+    monkeypatch.setattr(hooks_cli, "STATE_DIR", tmp_path)
+    payload = {
+        "entry": entry,
+        "idempotency_key": "checkpoint-key",
+        "hook_ack": {"session_id": "test"},
+    }
+    first = service.run_diary_write(payload)
+    stored = collection.get(include=["documents", "metadatas"])
+    repeated = service.run_diary_write(payload)
+    assert first["success"] and repeated["success"]
+    assert repeated["entry_id"] == first["entry_id"]
+    again = collection.get(include=["documents", "metadatas"])
+    assert stored == again
+
+
+def test_hook_started_daemon_retries_queued_work_after_writer_releases(state, monkeypatch):
+    import contextlib
+
+    from mempalace import palace
+
+    store = daemon_queue.QueueStore(daemon_queue.queue_path(state))
+    queued = store.enqueue("mine", {"source": "s"})
+    attempts = []
+
+    @contextlib.contextmanager
+    def briefly_held(path):
+        attempts.append(path)
+        if len(attempts) == 1:
+            raise palace.MineAlreadyRunning("writer busy")
+        yield
+
+    monkeypatch.setattr(daemon, "backend_requires_single_writer", lambda backend: True)
+    monkeypatch.setattr(daemon, "mine_palace_lock", briefly_held)
+    monkeypatch.setattr("mempalace.service.execute_job", lambda *a: {"success": True})
+    thread, errors = _serve_in_thread(state, idle_exit_minutes=0.01)
+    thread.join(timeout=12)
+    assert not errors and not thread.is_alive()
+    assert store.get(queued.id).state == "succeeded"
+
+
+def test_hook_started_daemon_gives_up_on_a_writer_that_never_releases(state, monkeypatch):
+    """A writer lease that stays taken (a long-lived writable MCP server) must
+    not leave an unregistered daemon holding the singleton forever."""
+    import contextlib
+
+    from mempalace import palace
+
+    store = daemon_queue.QueueStore(daemon_queue.queue_path(state))
+    queued = store.enqueue("mine", {"source": "s"})
+
+    @contextlib.contextmanager
+    def always_held(path):
+        raise palace.MineAlreadyRunning("writer busy")
+        yield
+
+    monkeypatch.setattr(daemon, "backend_requires_single_writer", lambda backend: True)
+    monkeypatch.setattr(daemon, "mine_palace_lock", always_held)
+    monkeypatch.setattr(daemon, "WRITER_LEASE_WAIT_SECONDS", 0.0)
+    thread, errors = _serve_in_thread(state, idle_exit_minutes=0.01)
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert len(errors) == 1 and isinstance(errors[0], daemon.DaemonError)
+    assert store.get(queued.id).state == "queued", "the job waits for the next daemon"
+    with daemon_queue.daemon_singleton(state, retry_seconds=0) as won:
+        assert won, "the singleton was released"
+
+
+def test_contended_queue_returns_within_hook_budget(state, monkeypatch):
+    import sqlite3
+
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", state)
+    path = daemon_queue.queue_path(state)
+    store = daemon_queue.QueueStore(path)
+    with store._connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        # A maintenance writer can hold SQLite longer than the hook's budget.
+        t0 = time.monotonic()
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            hooks_cli._submit_daemon_job("mine", {"source": "s"})
+        assert time.monotonic() - t0 < 0.5
+
+
+def test_cli_start_keeps_registration_published_by_racing_hook_daemon(state, monkeypatch):
+    monkeypatch.setattr(daemon, "get_client_if_running", lambda *a, **kw: None)
+    with daemon_queue.daemon_singleton(state) as won:
+        assert won
+
+        def publish(_):
+            daemon_queue._write_private(
+                daemon.endpoint_path(state), json.dumps({"pid": os.getpid(), "port": 1})
+            )
+            daemon_queue._write_private(daemon.pid_path(state), str(os.getpid()))
+
+        monkeypatch.setattr(daemon, "_refuse_live_registration", publish)
+        with patch.object(daemon.subprocess, "Popen", side_effect=OSError("end test")):
+            with pytest.raises(OSError, match="end test"):
+                daemon.start_daemon(state)
+        assert daemon_queue._registered_pid(state) == os.getpid()

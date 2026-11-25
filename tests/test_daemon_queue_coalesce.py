@@ -242,3 +242,126 @@ def test_stop_hook_mine_is_queued_with_the_stop_debounce(tmp_path, monkeypatch):
     assert diary_job.run_after == pytest.approx(diary_job.deadline), "diary is never debounced"
     # The daemon, never the client, decides which palace a job writes to.
     assert stop_job.payload["palace_path"] == daemon_queue.canonical_palace_path(str(palace))
+
+
+def test_claim_rechecks_debounce_after_select(store, monkeypatch):
+    import contextlib
+
+    hook = daemon.QueueStore(store.path, clock=store.clock)
+    job = hook.enqueue("mine", {"rev": 1}, dedupe_key="k", settle_seconds=5, max_wait_seconds=60)
+    store.test_clock.t = job.run_after
+    connect = store._connect
+    updates = []
+
+    @contextlib.contextmanager
+    def interleave():
+        with connect() as conn:
+
+            def before_update(sql):
+                if "SET state = 'running'" in sql:
+                    updates.append(
+                        hook.enqueue(
+                            "mine",
+                            {"rev": 2},
+                            dedupe_key="k",
+                            settle_seconds=5,
+                            max_wait_seconds=60,
+                        )
+                    )
+
+            conn.set_trace_callback(before_update)
+            yield conn
+
+    with monkeypatch.context() as m:
+        m.setattr(store, "_connect", interleave)
+        claimed = store.claim_next()
+    assert len(updates) == 1 and updates[0].run_after > store.clock()
+    assert claimed is None
+    assert store.get(job.id).attempts == 0
+    store.test_clock.t = updates[0].run_after
+    assert store.claim_next().payload == {"rev": 2}
+
+
+def test_failed_migration_rolls_back_schema(tmp_path, monkeypatch):
+    import contextlib
+
+    path = tmp_path / "queue.sqlite3"
+    _old_schema_db(path)
+    connect = daemon.QueueStore._connect
+
+    @contextlib.contextmanager
+    def refuse_drop(store):
+        with connect(store) as conn:
+            conn.set_authorizer(
+                lambda action, *_: (
+                    sqlite3.SQLITE_DENY
+                    if action == sqlite3.SQLITE_DROP_INDEX
+                    else sqlite3.SQLITE_OK
+                )
+            )
+            yield conn
+
+    with monkeypatch.context() as m:
+        m.setattr(daemon.QueueStore, "_connect", refuse_drop)
+        with pytest.raises(sqlite3.DatabaseError):
+            daemon.QueueStore(path)
+    with contextlib.closing(sqlite3.connect(path)) as conn:
+        assert "run_after" not in [r[1] for r in conn.execute("PRAGMA table_info(jobs)")]
+    assert len(daemon.QueueStore(path).list()) == 3
+
+
+def test_debounced_hook_preserves_legacy_rows_immediate_schedule(tmp_path):
+    path = tmp_path / "queue.sqlite3"
+    _old_schema_db(path)
+    store = daemon.QueueStore(path, clock=_Clock())
+    store.enqueue("mine", {"rev": 2}, dedupe_key="A", settle_seconds=120)
+    assert store.claim_next().payload == {"rev": 2}
+
+
+def test_concurrent_processes_migrate_and_enqueue_a_single_rerun(tmp_path):
+    import subprocess
+    import sys
+    import textwrap
+
+    path = tmp_path / "queue.sqlite3"
+    _old_schema_db(path)
+    script = textwrap.dedent("""
+        import sys
+        from pathlib import Path
+        from mempalace.daemon_queue import QueueStore
+        print("ready", flush=True)
+        input()
+        store = QueueStore(Path(sys.argv[1]))
+        job = store.enqueue("mine", {"rev": int(sys.argv[2])}, dedupe_key="B")
+        print(job.id, flush=True)
+    """)
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", script, str(path), str(i)],
+            text=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+        )
+        for i in range(4)
+    ]
+    try:
+        for proc in procs:
+            assert proc.stdout.readline().strip() == "ready"
+        for proc in procs:
+            proc.stdin.write("\n")
+            proc.stdin.flush()
+        ids = {proc.communicate(timeout=10)[0].strip() for proc in procs}
+        assert all(proc.returncode == 0 for proc in procs)
+        assert len(ids) == 1
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+    store = daemon.QueueStore(path)
+    assert store.get("r1").state == "running"
+    last = store.enqueue("mine", {"rev": 99}, dedupe_key="B")
+    assert last.id in ids
+    store.finish("r1", state="succeeded")
+    assert store.claim_next().id == "q1"
+    assert store.claim_next().payload == {"rev": 99}

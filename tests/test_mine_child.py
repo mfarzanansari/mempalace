@@ -395,3 +395,258 @@ def test_child_takes_the_lock_itself_when_the_daemon_does_not_hold_it(tmp_path):
         )
         assert result["success"] is True, result
         assert result["adopted"] is held
+
+
+def test_proxy_respects_server_embedder(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from mempalace import mine_supervisor, palace
+
+    monkeypatch.setattr(
+        palace,
+        "get_backend_for_palace",
+        lambda *_a, **_kw: SimpleNamespace(capabilities={"server_embedder"}),
+    )
+    assert mine_supervisor._caps(object(), str(tmp_path), None)["server_embedder"]
+
+
+# A child that heartbeats every 50 ms while it burns CPU, marking progress
+# every PROGRESS_EVERY CPU-seconds (0 = never), then reports done.
+_BURNING_CHILD = textwrap.dedent(
+    """
+    import os, sys, time
+    from mempalace import mine_child as m
+    m._CHANNEL = channel = m._Channel(sys.stdin.buffer, sys.stdout.buffer)
+    m._read_msg(sys.stdin.buffer)
+    channel.notify({"op": "started", "pid": os.getpid(), "priority": "normal"})
+    channel.start_heartbeat(interval=0.05)
+    every = float(os.environ["PROGRESS_EVERY"])
+    start = mark = time.process_time()
+    while time.process_time() - start < 2.0:
+        if every and time.process_time() - mark > every:
+            channel.mark_progress()
+            mark = time.process_time()
+    channel.notify({"op": "done", "result": {"success": True}})
+    """
+)
+
+
+def test_cpu_bound_child_heartbeating_without_progress_is_reaped(tmp_path, monkeypatch):
+    """A pure-Python loop that never returns still heartbeats; its CPU gives it away."""
+    monkeypatch.setenv("PROGRESS_EVERY", "0")
+    result = run_mine_in_child(
+        {},
+        palace_path=str(tmp_path),
+        write_lock=threading.RLock(),
+        argv=_child_argv(_BURNING_CHILD),
+        stall_seconds=5.0,
+        cpu_stall_seconds=0.5,
+    )
+    assert result.get("error_class") == "MineChildKilled", result
+    assert "CPU-s without progress" in result["error"]
+
+
+def test_long_compute_that_reports_progress_is_not_reaped(tmp_path, monkeypatch):
+    """Embedding one 1000-drawer upsert takes minutes of CPU before its single
+    storage call. Embedded slices count as progress, so that mine is not taken
+    for a spinning one (which it was when only storage calls counted)."""
+    monkeypatch.setenv("PROGRESS_EVERY", "0.2")
+    result = run_mine_in_child(
+        {},
+        palace_path=str(tmp_path),
+        write_lock=threading.RLock(),
+        argv=_child_argv(_BURNING_CHILD),
+        stall_seconds=5.0,
+        cpu_stall_seconds=0.5,
+    )
+    assert result["success"] is True, result
+
+
+def test_default_cpu_budget_is_a_multiple_of_the_stall_limit(tmp_path, monkeypatch):
+    """With only ``stall_seconds`` set, a heartbeating compute may run several
+    stall windows of CPU before it is judged stuck."""
+    from mempalace import mine_supervisor
+
+    monkeypatch.setenv("PROGRESS_EVERY", "0")
+    assert mine_supervisor.CPU_STALL_FACTOR >= 5
+    result = run_mine_in_child(
+        {},
+        palace_path=str(tmp_path),
+        write_lock=threading.RLock(),
+        argv=_child_argv(_BURNING_CHILD),
+        stall_seconds=0.5,  # 2 CPU-s of work is under 5 x 0.5
+    )
+    assert result["success"] is True, result
+
+
+def test_sliced_embedder_keeps_order_and_marks_progress(monkeypatch):
+    from mempalace import mine_child
+
+    calls = []
+
+    def embed(texts, *, query=False, metadatas=None, embedder=None):
+        calls.append((len(texts), None if metadatas is None else [m["i"] for m in metadatas]))
+        return [[float(t)] for t in texts]
+
+    marks = []
+    monkeypatch.setattr(
+        mine_child, "_CHANNEL", type("C", (), {"mark_progress": lambda self: marks.append(1)})()
+    )
+    texts = [str(i) for i in range(600)]
+    metas = [{"i": i} for i in range(600)]
+    out = mine_child._sliced_embedder(embed)(texts, metadatas=metas)
+    assert out == [[float(i)] for i in range(600)]
+    assert [n for n, _ in calls] == [256, 256, 88]
+    assert all(n % 32 == 0 for n, _ in calls[:-1]), "slices must keep 32-doc sub-batches"
+    assert calls[1][1] == list(range(256, 512)), "metadatas must stay aligned with texts"
+    assert len(marks) == 3
+    assert mine_child._sliced_embedder(embed)([]) == []
+
+
+# A child that reports SCHED_IDLE, then goes silent: no heartbeat, no call.
+_SILENT_IDLE_CHILD = textwrap.dedent(
+    """
+    import os, sys, time
+    from mempalace import mine_child as m
+    m._read_msg(sys.stdin.buffer)
+    m._write_msg(sys.stdout.buffer, {"op": "started", "pid": os.getpid(),
+                                     "priority": "sched-idle"})
+    time.sleep(float(os.environ["SILENT_FOR"]))
+    m._write_msg(sys.stdout.buffer, {"op": "done", "result": {"success": True}})
+    """
+)
+
+
+def _silent_idle(tmp_path, monkeypatch, sampler, silent_for):
+    monkeypatch.setenv("SILENT_FOR", str(silent_for))
+    return run_mine_in_child(
+        {},
+        palace_path=str(tmp_path),
+        write_lock=threading.RLock(),
+        argv=_child_argv(_SILENT_IDLE_CHILD),
+        stall_seconds=0.4,
+        proc_sampler=sampler,
+    )
+
+
+def test_starved_idle_child_survives_heartbeat_silence(tmp_path, monkeypatch):
+    """SCHED_IDLE on a saturated machine: runnable, CPU flat. Not a stall."""
+    result = _silent_idle(tmp_path, monkeypatch, lambda pid: (100, True), silent_for=1.5)
+    assert result["success"], result
+
+
+def test_blocked_idle_child_is_reaped(tmp_path, monkeypatch):
+    """CPU flat and no thread runnable: blocked for good (a native hang), not starved."""
+    result = _silent_idle(tmp_path, monkeypatch, lambda pid: (100, False), silent_for=60)
+    assert result["error_class"] == "MineChildKilled", result
+
+
+def test_spinning_idle_child_is_reaped(tmp_path, monkeypatch):
+    """CPU advancing while silent: the child runs but cannot talk. Killed."""
+    ticks = iter(range(10**6))
+    result = _silent_idle(tmp_path, monkeypatch, lambda pid: (next(ticks), True), silent_for=60)
+    assert result["error_class"] == "MineChildKilled", result
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="/proc sampling is Linux-only")
+def test_real_sampler_reaps_a_sleeping_idle_child(tmp_path, monkeypatch):
+    """Through /proc: a sleeping child has no runnable thread, so it is reaped."""
+    from mempalace.mine_supervisor import _sample_proc
+
+    assert _sample_proc(os.getpid())[1] is True  # this thread is running
+    result = _silent_idle(tmp_path, monkeypatch, _sample_proc, silent_for=60)
+    assert result["error_class"] == "MineChildKilled", result
+
+
+def test_killed_mine_rebuilds_closet_for_committed_drawers(tmp_path, monkeypatch):
+    from mempalace.palace import get_closets_collection, get_collection
+
+    palace = str(tmp_path / "palace")
+    source = _project(tmp_path)
+    payload = {"palace_path": palace, "source": str(source), "mode": "projects", "wing": "proj"}
+    skip_model = "import mempalace.embedding as emb\nemb.probe_dimension = lambda: _DIM\n"
+    crash = "import os, mempalace.miner as miner\nminer.purge_file_closets = lambda *args: os._exit(7)\n"
+
+    def run(extra):
+        return run_mine_in_child(
+            payload,
+            palace_path=palace,
+            write_lock=threading.RLock(),
+            argv=_child_argv(skip_model + extra + REAL_CHILD),
+        )
+
+    assert run(crash)["error_class"] == "MineChildDied"
+    original = get_collection(palace).get(include=["documents"])
+    assert original.ids and "heron" in original.documents[0]
+    assert run("")["success"]
+    after = get_collection(palace).get(include=["documents"])
+    assert (after.ids, after.documents) == (original.ids, original.documents)
+    assert get_closets_collection(palace).count() > 0
+
+
+def test_mine_sidecar_writes_are_served_by_the_daemon(tmp_path, monkeypatch):
+    import contextlib
+
+    from mempalace import hallways, miner, revisions
+
+    writes = []
+
+    @contextlib.contextmanager
+    def track_hallways(config):
+        writes.append("hallways")
+        with writing(config) as conn:
+            yield conn
+
+    writing = hallways._writing
+    monkeypatch.setattr(hallways, "_writing", track_hallways)
+    monkeypatch.setattr(
+        miner, "_compute_topic_tunnels_for_wing", lambda *a, **kw: writes.append("topics") or 0
+    )
+    monkeypatch.setattr(
+        miner, "_compute_entity_tunnels_for_wing", lambda *a, **kw: writes.append("entities") or 0
+    )
+    monkeypatch.setattr(
+        revisions, "append_drawer_revisions", lambda *a: writes.append("revisions") or ["rev"]
+    )
+    script = textwrap.dedent("""
+        import sys
+        from mempalace import mine_child, service
+        def run(payload):
+            from mempalace import hallways, miner, revisions
+            from mempalace.config import MempalaceConfig
+            cfg = MempalaceConfig(palace_path=payload["palace_path"])
+            class Rows:
+                def get(self, **kwargs):
+                    rows = [{"entities": "First,Second", "room": "r", "wing": "w"}] if kwargs["offset"] == 0 else []
+                    return {"ids": ["d"] if rows else [], "metadatas": rows}
+            hallways.compute_hallways_for_wing("w", col=Rows(), config=cfg)
+            miner._compute_topic_tunnels_for_wing("w", config=cfg)
+            miner._compute_entity_tunnels_for_wing("w", config=cfg)
+            revisions.append_drawer_revisions(cfg.palace_path, [("d","prior text",{})])
+            return {"success":True}
+        service.run_mine = run
+        sys.exit(mine_child.main())
+    """)
+    result = run_mine_in_child(
+        {"palace_path": str(tmp_path)},
+        palace_path=str(tmp_path),
+        write_lock=threading.RLock(),
+        argv=_child_argv(script),
+    )
+    assert result["success"], result
+    assert writes == ["hallways", "topics", "entities", "revisions"]
+
+
+def test_adapter_with_direct_graph_access_runs_under_daemon_write_lock(tmp_path, monkeypatch):
+    from mempalace import service
+
+    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "state"))
+    monkeypatch.setenv("MEMPALACE_DAEMON_MINE_CHILD", "1")
+    runtime = daemon.DaemonRuntime(str(tmp_path))
+
+    def execute(kind, payload):
+        return {"success": True, "writer": os.getpid()}
+
+    monkeypatch.setattr(service, "execute_job", execute)
+    job = runtime.store.enqueue("mine", {"source_adapter": "fixture"})
+    assert runtime._run_job(job, job.payload).get("writer") == os.getpid()
