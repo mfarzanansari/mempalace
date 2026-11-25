@@ -1723,6 +1723,23 @@ class MempalaceConfig:
         return settle, max_wait
 
     @property
+    def hook_daemon_autostart(self) -> bool:
+        """Whether hooks start the daemon (detached) when it is not running.
+
+        Consulted only when hook write routing is ``prefer`` or ``require``;
+        the default ``direct`` policy never touches the daemon. Env
+        ``MEMPALACE_HOOK_DAEMON_AUTOSTART`` > config ``hooks.daemon_autostart``
+        > on. Turn it off for installs that supervise the daemon themselves.
+        """
+        flag = env_flag("MEMPALACE_HOOK_DAEMON_AUTOSTART")
+        if flag is not None:
+            return flag
+        hooks = self._file_config.get("hooks", {})
+        value = hooks.get("daemon_autostart", True) if isinstance(hooks, dict) else True
+        parsed = parse_bool(value) if isinstance(value, (bool, str)) else None
+        return True if parsed is None else parsed
+
+    @property
     def hook_use_daemon(self):
         """Whether hooks should submit save/mine work to the opt-in daemon."""
         flag = env_flag("MEMPALACE_HOOKS_DAEMON")
