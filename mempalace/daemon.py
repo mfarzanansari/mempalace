@@ -123,18 +123,59 @@ def read_token(palace_path: str) -> str:
         raise DaemonError(f"daemon token not found for {palace_path}") from exc
 
 
+# Diary entries take their own lane so a long mine never holds them back.
+DIARY_LANE_KINDS = ("diary_write",)
+WORKER_LANES = ("main", "diary")
+
+
+class _LaneWake:
+    """One wake-up event per lane; ``set`` wakes them all."""
+
+    def __init__(self, lanes):
+        self.events = {lane: threading.Event() for lane in lanes}
+
+    def set(self) -> None:
+        for event in self.events.values():
+            event.set()
+
+
 class DaemonRuntime:
+    """Queue workers for one palace.
+
+    Two lanes drain the queue: ``main`` runs every kind except ``diary_write``,
+    and ``diary`` runs only ``diary_write``. Both write through this one
+    process, and every in-process write takes ``write_lock``. A mine job runs
+    its compute in a child process (:mod:`mempalace.mine_supervisor`) whose
+    storage calls the daemon serves under the same lock, one call at a time,
+    so a diary entry lands between a mine's batches.
+    """
+
     def __init__(self, palace_path: str, backend: str | None = None):
         self.palace_path = canonical_palace_path(palace_path)
         self.backend = backend
         self.store = QueueStore(queue_path(self.palace_path))
         self.shutdown_event = threading.Event()
-        self.worker_wake = threading.Event()
-        self.active_job_id: str | None = None
-        self.worker_thread: threading.Thread | None = None
+        self.worker_wake = _LaneWake(WORKER_LANES)
+        self.write_lock = threading.RLock()
+        # lane -> id of the job that lane is running.
+        self.active_jobs: dict[str, str] = {}
+        # The mine child the main lane is supervising, if any.
+        self.active_child = None
+        # Command for the mine child; None runs ``mempalace.mine_child``.
+        self.mine_child_argv: list[str] | None = None
+        self.worker_threads: dict[str, threading.Thread] = {}
         # job_id -> monotonic deadline before which a lock-refused job is not
-        # re-claimed. Worker-owned; only _worker_loop touches it.
+        # re-claimed. Each lane only touches its own jobs' entries.
         self._deferred_until: dict[str, float] = {}
+        self._deferred_lock = threading.Lock()
+
+    @property
+    def active_job_id(self) -> str | None:
+        return self.active_jobs.get("main") or self.active_jobs.get("diary")
+
+    @property
+    def worker_thread(self) -> threading.Thread | None:
+        return self.worker_threads.get("main")
 
     def start_worker(self) -> threading.Thread:
         self.store.recover_running()
@@ -145,15 +186,32 @@ class DaemonRuntime:
             self.store.prune_terminal()
         except Exception:  # noqa: BLE001 - retention is best-effort, never fatal
             pass
-        thread = threading.Thread(
-            target=self._worker_loop, name="mempalace-daemon-worker", daemon=True
-        )
-        self.worker_thread = thread
-        thread.start()
-        return thread
+        lanes = {
+            "main": {"exclude_kinds": DIARY_LANE_KINDS},
+            "diary": {"kinds": DIARY_LANE_KINDS},
+        }
+        for lane, claim in lanes.items():
+            thread = threading.Thread(
+                target=self._worker_loop,
+                args=(lane, claim),
+                name=f"mempalace-daemon-worker-{lane}",
+                daemon=True,
+            )
+            self.worker_threads[lane] = thread
+            thread.start()
+        return self.worker_threads["main"]
 
     def worker_alive(self) -> bool:
-        return self.worker_thread is not None and self.worker_thread.is_alive()
+        return bool(self.worker_threads) and all(
+            thread.is_alive() for thread in self.worker_threads.values()
+        )
+
+    def alive_workers(self) -> list[threading.Thread]:
+        return [thread for thread in self.worker_threads.values() if thread.is_alive()]
+
+    def progress(self) -> dict | None:
+        child = self.active_child
+        return child.progress() if child is not None else None
 
     def _safe_finish(self, job_id: str, *, state: str, result: dict, error: dict | None) -> None:
         try:
@@ -183,25 +241,51 @@ class DaemonRuntime:
         holding back and cannot grow without bound.
         """
         now = time.monotonic()
-        self._deferred_until = {
-            job_id: until for job_id, until in self._deferred_until.items() if until > now
-        }
-        return set(self._deferred_until)
+        with self._deferred_lock:
+            self._deferred_until = {
+                job_id: until for job_id, until in self._deferred_until.items() if until > now
+            }
+            return set(self._deferred_until)
 
-    def _worker_loop(self) -> None:
+    def _run_job(self, job: Job, payload: dict) -> dict:
+        from .config import MempalaceConfig
         from .service import execute_job
 
+        config = MempalaceConfig()
+        if job.kind == "mine" and config.daemon_mine_child:
+            from .mine_supervisor import run_mine_in_child
+
+            def _attach(child) -> None:
+                self.active_child = child
+
+            try:
+                return run_mine_in_child(
+                    payload,
+                    palace_path=self.palace_path,
+                    write_lock=self.write_lock,
+                    threads=config.daemon_mine_threads,
+                    on_start=_attach,
+                    argv=self.mine_child_argv,
+                )
+            finally:
+                self.active_child = None
+        with self.write_lock:
+            return execute_job(job.kind, payload)
+
+    def _worker_loop(self, lane: str = "main", claim: dict | None = None) -> None:
+        claim = claim or {}
         while not self.shutdown_event.is_set():
             try:
-                job = self.store.claim_next(exclude=self._cooling_job_ids())
+                job = self.store.claim_next(exclude=self._cooling_job_ids(), **claim)
             except Exception:  # noqa: BLE001 - sqlite/disk errors must not kill the worker
                 self.shutdown_event.wait(1.0)
                 continue
             if job is None:
-                self.worker_wake.wait(0.5)
-                self.worker_wake.clear()
+                wake = self.worker_wake.events[lane]
+                wake.wait(0.5)
+                wake.clear()
                 continue
-            self.active_job_id = job.id
+            self.active_jobs[lane] = job.id
             try:
                 payload = dict(job.payload)
                 # Override, never trust the client: an authenticated request for
@@ -209,7 +293,7 @@ class DaemonRuntime:
                 payload["palace_path"] = self.palace_path
                 if self.backend:
                     payload["backend"] = self.backend
-                result = execute_job(job.kind, payload)
+                result = self._run_job(job, payload)
                 ok = bool(result.get("success", True))
                 if not ok and result.get("error_class") == LOCK_REFUSAL_ERROR_CLASS:
                     # Refused the palace write lock: no drawer was filed, so this
@@ -227,18 +311,23 @@ class DaemonRuntime:
                             ),
                         },
                     )
-                    # Cool the job off in the map instead of sleeping here. This
-                    # is the only worker, and the holder may outlive any wait we
-                    # could pick -- it keeps the lock until its write finishes,
-                    # and that write can be a long mine. Blocking would stall
-                    # every unrelated job behind a lock that has nothing to do
-                    # with them, and a job merely queued behind this one would
-                    # never be claimed, so it would never get the refusal marker
-                    # its caller waits on, and that caller would hang.
-                    self._deferred_until[job.id] = time.monotonic() + LOCK_DEFER_BACKOFF_SECONDS
+                    # Cool the job off in the map instead of sleeping here. The
+                    # holder may outlive any wait we could pick -- it keeps the
+                    # lock until its write finishes, and that write can be a
+                    # long mine. Blocking would stall every unrelated job behind
+                    # a lock that has nothing to do with them, and a job merely
+                    # queued behind this one would never be claimed, so it would
+                    # never get the refusal marker its caller waits on, and that
+                    # caller would hang.
+                    with self._deferred_lock:
+                        self._deferred_until[job.id] = time.monotonic() + LOCK_DEFER_BACKOFF_SECONDS
                     continue
                 state = "succeeded" if ok else "failed"
-                error = None if ok else {"message": result.get("error", "job failed")}
+                error = None
+                if not ok:
+                    error = {"message": result.get("error", "job failed")}
+                    if result.get("error_class"):
+                        error["error_class"] = result["error_class"]
                 self._safe_finish(job.id, state=state, result=result, error=error)
             except (Exception, SystemExit) as exc:
                 # SystemExit is BaseException, not Exception — catching it here is
@@ -253,7 +342,7 @@ class DaemonRuntime:
                     error={"error_class": type(exc).__name__, "message": str(exc)},
                 )
             finally:
-                self.active_job_id = None
+                self.active_jobs.pop(lane, None)
 
 
 def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
@@ -278,7 +367,7 @@ def _restore_server_process_state(previous_env: dict[str, str | None], previous_
 
 def _close_writer_lease_after_worker(
     writer_lease: contextlib.ExitStack,
-    worker: threading.Thread,
+    worker: "threading.Thread | list[threading.Thread]",
 ) -> None:
     """Retain writer ownership until a timed-out daemon worker really exits.
 
@@ -287,9 +376,11 @@ def _close_writer_lease_after_worker(
     process, this reaper prevents the server thread from exposing the palace to
     another writer while the old worker is still finishing a mutation.
     """
+    workers = worker if isinstance(worker, list) else [worker]
 
     def _wait_and_close() -> None:
-        worker.join()
+        for thread in workers:
+            thread.join()
         writer_lease.close()
 
     threading.Thread(
@@ -303,9 +394,9 @@ def _close_or_defer_writer_lease(
     writer_lease: contextlib.ExitStack,
     runtime: "DaemonRuntime | None",
 ) -> None:
-    worker = runtime.worker_thread if runtime is not None else None
-    if worker is not None and worker.is_alive():
-        _close_writer_lease_after_worker(writer_lease, worker)
+    workers = runtime.alive_workers() if runtime is not None else []
+    if workers:
+        _close_writer_lease_after_worker(writer_lease, workers)
     else:
         writer_lease.close()
 
@@ -494,6 +585,8 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
                         "palace_path": runtime.palace_path,
                         "backend": runtime.backend,
                         "active_job_id": runtime.active_job_id,
+                        "active_jobs": dict(runtime.active_jobs),
+                        "mine_progress": runtime.progress(),
                         "counts": runtime.store.counts(),
                     },
                 )
@@ -623,17 +716,22 @@ def _drain_and_cleanup(
     content). Finally restore the env vars run_server mutated.
     """
     runtime.shutdown_event.set()
-    worker = runtime.worker_thread
-    if worker is not None:
-        worker.join(timeout=SHUTDOWN_DRAIN_SECONDS)
-    active = runtime.active_job_id
-    if active:
+    deadline = time.monotonic() + SHUTDOWN_DRAIN_SECONDS
+    for worker in list(runtime.worker_threads.values()):
+        worker.join(timeout=max(0.0, deadline - time.monotonic()))
+    for active in list(runtime.active_jobs.values()):
         runtime._safe_finish(
             active,
             state="cancelled",
             result={"success": False, "exit_code": 1},
             error={"message": "cancelled by daemon shutdown"},
         )
+    child = runtime.active_child
+    if child is not None:
+        # A mine child only computes; every write it asked for already ran
+        # here, whole. Stopping it loses no stored data, and the next mine
+        # resumes where it stopped.
+        child.kill("daemon shutdown")
     for stale in (endpoint_path(palace_path), pid_path(palace_path)):
         try:
             stale.unlink()

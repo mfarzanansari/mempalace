@@ -71,6 +71,25 @@ Diary checkpoints are queued the same way. The daemon files the drawer and
 then writes the checkpoint ack and the session's save marker, so the marker
 still advances only once the entry is really stored.
 
+### Where a daemon mine runs
+
+The daemon is the palace's only writer. A mine job's compute (reading files,
+chunking, embedding) runs in a child process at background priority: Linux
+`SCHED_IDLE` (fallback `nice 19`), macOS `taskpolicy -b`, Windows background
+mode (fallback idle priority class). The child never opens the storage backend;
+each collection call it makes travels over a pipe and runs in the daemon, with
+vectors the child already computed. A persistent Chroma database therefore
+stays open in one process only.
+
+The daemon serves those calls one at a time under a write lock that diary
+checkpoints also take, and diary checkpoints have their own worker lane, so a
+checkpoint lands between a long mine's batches instead of after it.
+
+The child uses 2 ONNX Runtime intra-op threads with thread spinning off:
+
+    MEMPALACE_DAEMON_MINE_THREADS=2        # or daemon.mine_threads; 0 = embedding_threads
+    MEMPALACE_DAEMON_MINE_CHILD=0          # or daemon.mine_child: false; mine on the daemon thread
+
 ### Turning auto-start off
 
 Auto-start only acts under `prefer` or `require`; the default `direct` policy
