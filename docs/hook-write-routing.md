@@ -90,6 +90,15 @@ The child uses 2 ONNX Runtime intra-op threads with thread spinning off:
     MEMPALACE_DAEMON_MINE_THREADS=2        # or daemon.mine_threads; 0 = embedding_threads
     MEMPALACE_DAEMON_MINE_CHILD=0          # or daemon.mine_child: false; mine on the daemon thread
 
+The child sends a heartbeat every 10 s, and the daemon's reaper kills a child
+that has sent nothing for 60 s (time the daemon spends running one of its
+calls does not count), or one still running 30 s after it reported done. The
+job then fails and the daemon keeps going; writes already made stay, and the
+next mine resumes from them. `/health` reports the running child under
+`mine_progress` (pid, calls served, seconds since its last message).
+
+    MEMPALACE_DAEMON_MINE_STALL_SECONDS=60  # or daemon.mine_stall_seconds; 0 = no reaper
+
 ### Turning auto-start off
 
 Auto-start only acts under `prefer` or `require`; the default `direct` policy

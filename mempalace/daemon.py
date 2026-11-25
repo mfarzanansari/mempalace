@@ -266,6 +266,7 @@ class DaemonRuntime:
                     threads=config.daemon_mine_threads,
                     on_start=_attach,
                     argv=self.mine_child_argv,
+                    stall_seconds=config.daemon_mine_stall_seconds,
                 )
             finally:
                 self.active_child = None

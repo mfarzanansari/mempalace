@@ -1775,6 +1775,23 @@ class MempalaceConfig:
             return 2
 
     @property
+    def daemon_mine_stall_seconds(self) -> float:
+        """Seconds a daemon mine child may go silent before it is killed.
+
+        The child sends a heartbeat every 10 s and a message per storage call;
+        time the daemon spends running a call does not count. Env
+        ``MEMPALACE_DAEMON_MINE_STALL_SECONDS`` > config
+        ``daemon.mine_stall_seconds`` > 60. ``0`` disables the reaper.
+        """
+        raw = os.environ.get("MEMPALACE_DAEMON_MINE_STALL_SECONDS")
+        if raw is None:
+            raw = self._daemon_section().get("mine_stall_seconds", 60)
+        try:
+            return max(0.0, float(str(raw).strip()))
+        except (TypeError, ValueError):
+            return 60.0
+
+    @property
     def hook_use_daemon(self):
         """Whether hooks should submit save/mine work to the opt-in daemon."""
         flag = env_flag("MEMPALACE_HOOKS_DAEMON")

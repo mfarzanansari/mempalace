@@ -27,6 +27,10 @@ from .mine_child import _read_msg, _write_msg
 _OUTPUT_TAIL_BYTES = 64 * 1024
 # Rows per page when the child streams a metadata scan.
 _ITER_PAGE = 2000
+# A child silent this long (no request, no heartbeat) is wedged and killed.
+DEFAULT_STALL_SECONDS = 60.0
+# A child that reported done but has not exited after this long is killed.
+DEFAULT_EXIT_GRACE_SECONDS = 30.0
 
 
 def _child_env(palace_path: str, threads: int) -> dict:
@@ -76,6 +80,9 @@ class MineChild:
         self.priority: Optional[str] = None
         self.done_at: Optional[float] = None
         self.killed_reason: Optional[str] = None
+        # True while the daemon runs one of the child's calls: the child is
+        # waiting on us then, so its silence is not a stall.
+        self.serving = False
         self._output = bytearray()
         self._output_lock = threading.Lock()
         self._reader = threading.Thread(target=self._drain_stderr, daemon=True)
@@ -105,12 +112,18 @@ class MineChild:
         except OSError:
             pass
 
+    def stalled_for(self, now: float) -> float:
+        if self.serving or self.done_at is not None:
+            return 0.0
+        return now - self.last_progress
+
     def progress(self) -> dict:
         now = time.monotonic()
         return {
             "pid": self.pid,
             "calls": self.calls,
             "priority": self.priority,
+            "state": "done" if self.done_at else ("writing" if self.serving else "computing"),
             "running_seconds": round(now - self.started, 1),
             "seconds_since_progress": round(now - self.last_progress, 1),
         }
@@ -124,8 +137,17 @@ def run_mine_in_child(
     threads: int = 2,
     on_start: Optional[Callable[[MineChild], None]] = None,
     argv: Optional[list] = None,
+    stall_seconds: float = DEFAULT_STALL_SECONDS,
+    exit_grace_seconds: float = DEFAULT_EXIT_GRACE_SECONDS,
 ) -> dict:
     """Run one mine job in a child process; return the job result.
+
+    A reaper thread kills the child when it goes ``stall_seconds`` without a
+    message (requests and its heartbeat both count; time the daemon spends
+    serving a call does not), and the caller kills one that reported done but
+    is still running ``exit_grace_seconds`` later (#2917). Either way the job
+    fails and the daemon carries on; writes already made stay, and the next
+    mine picks up where this one stopped.
 
     ``argv`` overrides the child command (tests use a fake child).
     """
@@ -136,6 +158,14 @@ def run_mine_in_child(
     child = MineChild(proc)
     if on_start is not None:
         on_start(child)
+    reaper_stop = threading.Event()
+    if stall_seconds and stall_seconds > 0:
+        threading.Thread(
+            target=_reap_stalled,
+            args=(child, stall_seconds, reaper_stop),
+            name="mempalace-mine-reaper",
+            daemon=True,
+        ).start()
     handles: dict[int, Any] = {}
     gens: dict[int, Any] = {}
     writes_at_start = palace_write_serial()
@@ -159,6 +189,7 @@ def run_mine_in_child(
                 child.done_at = time.monotonic()
                 break
             child.calls += 1
+            child.serving = True
             try:
                 with write_lock:
                     value = _serve(
@@ -174,31 +205,58 @@ def run_mine_in_child(
                 reply = {"ok": True, "value": value}
             except BaseException as exc:  # noqa: BLE001 - every failure goes back to the child
                 reply = {"ok": False, "exc": _picklable_exc(exc)}
+            finally:
+                child.last_progress = time.monotonic()
+                child.serving = False
             try:
                 _write_msg(proc.stdin, reply)
             except (BrokenPipeError, OSError):
                 break
     finally:
+        reaper_stop.set()
         try:
             proc.stdin.close()
         except OSError:
             pass
         try:
-            proc.wait(timeout=30)
+            proc.wait(timeout=exit_grace_seconds)
         except subprocess.TimeoutExpired:
-            # Reported done but did not exit (#2917): its work is in; reap it.
-            child.kill("did not exit 30 s after reporting done")
+            # Reported done (or lost its channel) but did not exit (#2917).
+            child.kill(f"did not exit {exit_grace_seconds:g} s after its channel closed")
             proc.wait()
     output = child.output()
     if result is None:
-        reason = child.killed_reason or f"mine child exited with code {proc.returncode}"
-        result = {"success": False, "error": reason, "error_class": "MineChildDied", "exit_code": 1}
+        if child.killed_reason:
+            result = {
+                "success": False,
+                "error": child.killed_reason,
+                "error_class": "MineChildKilled",
+            }
+        else:
+            reason = f"mine child exited with code {proc.returncode} before finishing"
+            result = {"success": False, "error": reason, "error_class": "MineChildDied"}
+    elif child.killed_reason:
+        # Its mine finished and every write is in; only the exit was reaped.
+        result["reaped"] = child.killed_reason
     result.setdefault("success", True)
     result.setdefault("exit_code", 0 if result.get("success") else 1)
     result["child"] = child.progress()
     if output:
         result["stdout"] = output
     return result
+
+
+def _reap_stalled(child: MineChild, stall_seconds: float, stop: threading.Event) -> None:
+    tick = min(1.0, stall_seconds / 4)
+    while not stop.wait(tick):
+        if child.proc.poll() is not None:
+            return
+        silent = child.stalled_for(time.monotonic())
+        if silent > stall_seconds:
+            child.kill(
+                f"mine child sent nothing for {silent:.0f} s (stall limit {stall_seconds:g} s)"
+            )
+            return
 
 
 def _serve(op, msg, palace_path, handles, gens, writes_at_start, get_collection, validate):

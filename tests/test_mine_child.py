@@ -268,3 +268,83 @@ def test_mine_child_env_caps_threads_and_turns_off_spinning(monkeypatch):
     assert so is not None
     assert so.get_session_config_entry("session.intra_op.allow_spinning") == "0"
     assert _intra_op_session_options(2).intra_op_num_threads == 2
+
+
+def test_reaper_kills_a_wedged_child(tmp_path):
+    """A child that stops talking (no calls, no heartbeat) is killed and the job
+    fails; the supervisor returns instead of waiting on it forever (#2917)."""
+    palace = tmp_path / "palace"
+    wedged = textwrap.dedent(
+        """
+        import os, sys, time
+        from mempalace.mine_child import _read_msg, _write_msg
+        _read_msg(sys.stdin.buffer)
+        _write_msg(sys.stdout.buffer, {"op": "started", "pid": os.getpid(), "priority": "t"})
+        time.sleep(600)
+        """
+    )
+    started = time.monotonic()
+    result = run_mine_in_child(
+        {"palace_path": str(palace)},
+        palace_path=str(palace),
+        write_lock=threading.RLock(),
+        argv=_child_argv(wedged),
+        stall_seconds=1.0,
+    )
+    assert time.monotonic() - started < 30
+    assert result["success"] is False
+    assert result["error_class"] == "MineChildKilled"
+    assert "sent nothing" in result["error"]
+
+
+def test_heartbeat_keeps_a_slow_child_alive(tmp_path, monkeypatch):
+    """A long silent compute is not a stall while the child's heartbeat runs."""
+    palace = tmp_path / "palace"
+    slow = textwrap.dedent(
+        """
+        import os, sys, time
+        from mempalace import mine_child
+        rx, tx = sys.stdin.buffer, sys.stdout.buffer
+        mine_child._CHANNEL = mine_child._Channel(rx, tx)
+        mine_child._read_msg(rx)
+        mine_child._CHANNEL.notify({"op": "started", "pid": os.getpid(), "priority": "t"})
+        stop = mine_child._CHANNEL.start_heartbeat(interval=0.2)
+        time.sleep(3)
+        stop.set()
+        mine_child._CHANNEL.notify({"op": "done", "result": {"success": True}})
+        """
+    )
+    result = run_mine_in_child(
+        {"palace_path": str(palace)},
+        palace_path=str(palace),
+        write_lock=threading.RLock(),
+        argv=_child_argv(slow),
+        stall_seconds=1.0,
+    )
+    assert result["success"] is True, result
+
+
+def test_child_that_reports_done_but_never_exits_is_reaped(tmp_path):
+    palace = tmp_path / "palace"
+    lingering = textwrap.dedent(
+        """
+        import os, sys, time
+        from mempalace.mine_child import _read_msg, _write_msg
+        _read_msg(sys.stdin.buffer)
+        _write_msg(sys.stdout.buffer, {"op": "done", "result": {"success": True, "files": 1}})
+        time.sleep(600)
+        """
+    )
+    started = time.monotonic()
+    result = run_mine_in_child(
+        {"palace_path": str(palace)},
+        palace_path=str(palace),
+        write_lock=threading.RLock(),
+        argv=_child_argv(lingering),
+        exit_grace_seconds=1.0,
+    )
+    assert time.monotonic() - started < 30
+    # The mine's own result stands -- its writes are in -- and the reap is noted.
+    assert result["success"] is True
+    assert result["files"] == 1
+    assert "did not exit" in result["reaped"]
