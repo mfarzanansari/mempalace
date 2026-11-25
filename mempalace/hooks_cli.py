@@ -888,7 +888,9 @@ def _submit_daemon_job(
     payload = dict(payload)
     payload["palace_path"] = palace_path
     settle, max_wait = _mine_debounce() if kind == "mine" else (0.0, 0.0)
-    job = QueueStore(queue_path(palace_path)).enqueue(
+    # A failed enqueue is reported by the hook. Do not spend the daemon's
+    # 30-second maintenance busy timeout in the foreground hook.
+    job = QueueStore(queue_path(palace_path), timeout=0.15).enqueue(
         kind,
         payload,
         dedupe_key=dedupe_key,
@@ -903,7 +905,7 @@ def _submit_daemon_job(
 def _ensure_daemon_started(palace_path: str) -> None:
     """Start the daemon detached when this hook fire's route allows it."""
     routing = _current_hook_write_routing()
-    if not (routing.decision is not None and routing.decision.auto_start_daemon):
+    if not routing.use_daemon or not _daemon_autostart_enabled():
         return
     from .daemon_queue import spawn_daemon_detached
 
@@ -1418,6 +1420,11 @@ def _save_diary_direct(
                         "entry": entry,
                         "topic": "checkpoint",
                         "wing": wing,
+                        "idempotency_key": hashlib.sha256(
+                            json.dumps(
+                                [agent_name, wing, session_id, exchange_count, entry]
+                            ).encode()
+                        ).hexdigest(),
                         "hook_ack": {
                             "messages_folded": len(messages),
                             "ack_ts": utc_now_iso(),

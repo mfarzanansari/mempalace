@@ -155,8 +155,13 @@ QUEUE_SCHEMA_VERSION = 2
 SUPERSEDED_ERROR_CLASS = "Superseded"
 
 
+# Busy timeout for the one-time creation or migration of a queue file (see
+# ``QueueStore._init_db``); steady-state calls use the caller's timeout.
+INIT_BUSY_TIMEOUT_SECONDS = 2.0
+
+
 class QueueStore:
-    def __init__(self, path: Path, *, clock=time.time):
+    def __init__(self, path: Path, *, clock=time.time, timeout: float = 30.0):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
@@ -164,6 +169,7 @@ class QueueStore:
         # (the hook enqueues, the daemon claims), so a monotonic clock is out.
         # Injected by tests to drive the debounce deterministically.
         self.clock = clock
+        self.timeout = timeout
         self._init_db()
 
     @contextlib.contextmanager
@@ -176,7 +182,7 @@ class QueueStore:
         In a daemon that runs thousands of jobs that is an unbounded FD leak. This
         wrapper closes the connection on exit so each call is self-contained.
         """
-        conn = sqlite3.connect(str(self.path), timeout=30)
+        conn = sqlite3.connect(str(self.path), timeout=self.timeout)
         try:
             conn.row_factory = sqlite3.Row
             yield conn
@@ -201,7 +207,29 @@ class QueueStore:
             except sqlite3.Error:
                 pass
         with self._connect() as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
+            # Setup runs once per queue file, but every hook that fires before it
+            # lands queues up behind it. That one-time wait gets more than a
+            # hook's per-enqueue busy budget, so the first burst of hooks after
+            # an install or upgrade does not fail.
+            busy = max(self.timeout, INIT_BUSY_TIMEOUT_SECONDS)
+            conn.execute(f"PRAGMA busy_timeout = {int(busy * 1000)}")
+            # Two connections upgrading a new database to WAL can deadlock on
+            # the journal-mode change itself. SQLite returns BUSY immediately
+            # in that case, before its busy handler runs.
+            for attempt in range(6):
+                try:
+                    conn.execute("PRAGMA journal_mode=WAL").fetchone()
+                    break
+                except sqlite3.OperationalError as exc:
+                    if "locked" not in str(exc).lower() or attempt == 5:
+                        raise
+                    time.sleep(0.005 * (attempt + 1))
+            conn.execute("BEGIN IMMEDIATE")
+            if int(conn.execute("PRAGMA user_version").fetchone()[0]) == QUEUE_SCHEMA_VERSION:
+                # Another process finished the setup while this one waited.
+                conn.commit()
+                self._harden_files()
+                return
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS jobs (
@@ -337,6 +365,7 @@ class QueueStore:
         error_json: str | None = None,
         set_error: bool = False,
         refund_attempt: bool = False,
+        run_after: float | None = None,
     ) -> bool:
         """Move a running job back to ``queued``, unless a rerun already waits.
 
@@ -346,6 +375,9 @@ class QueueStore:
         the newer payload, so it supersedes the running row: that row is
         closed as ``cancelled`` with ``Superseded``, and the source is still
         processed once, by the rerun. Returns True when the row was re-queued.
+
+        ``run_after`` (epoch seconds) holds the re-queued row back until then;
+        None leaves its schedule as it was.
         """
         attempts_sql = "MAX(attempts - 1, 0)" if refund_attempt else "attempts"
         try:
@@ -354,10 +386,11 @@ class QueueStore:
                 UPDATE jobs
                 SET state = 'queued', started_at = NULL,
                     attempts = {attempts_sql},
-                    error_json = CASE WHEN ? THEN ? ELSE error_json END
+                    error_json = CASE WHEN ? THEN ? ELSE error_json END,
+                    run_after = COALESCE(?, run_after)
                 WHERE id = ? AND state = 'running' {extra_where}
                 """,
-                (int(set_error), error_json, job_id, *extra_params),
+                (int(set_error), error_json, run_after, job_id, *extra_params),
             )
             return cur.rowcount == 1
         except sqlite3.IntegrityError:
@@ -488,9 +521,9 @@ class QueueStore:
                 kind,
                 payload_json,
                 int(priority),
+                now,
                 now + max_wait,
-                now + max_wait,
-                now + max_wait,
+                now,
                 now + max_wait,
                 now + settle,
                 dedupe_key,
@@ -589,13 +622,14 @@ class QueueStore:
             if job_id is None:
                 return None
             cur = conn.execute(
-                """
+                f"""
                 UPDATE jobs
                 SET state = 'running', started_at = ?, attempts = attempts + 1,
                     error_json = NULL
-                WHERE id = ? AND state = 'queued'
+                WHERE id = ? AND state = 'queued' AND COALESCE(run_after, 0) <= ?
+                  {kind_sql}
                 """,
-                (_now(), job_id),
+                (_now(), job_id, now, *kind_params),
             )
             if cur.rowcount != 1:
                 # Lost the race to another process — nothing to run this iteration.
@@ -679,6 +713,35 @@ class QueueStore:
             )
             row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
             return self._row_to_job(row)
+
+    def retry(
+        self,
+        job_id: str,
+        *,
+        claimed_started_at: str | None,
+        delay_seconds: float = 0.0,
+        error: dict[str, Any] | None = None,
+    ) -> bool:
+        """Put a running job back in the queue to run again after a delay.
+
+        For work that is safe to redo -- a mine is idempotent per file -- whose
+        run was cut short: its child was killed or died, or the daemon is
+        shutting down. Like ``defer``, a newer queued rerun of the same key
+        supersedes it, and the update applies only to the claim
+        ``claimed_started_at`` names. The cut-short run keeps its attempt, so
+        a job that keeps being cut short is dead-lettered at ``MAX_ATTEMPTS``.
+        Returns True when the job was re-queued.
+        """
+        with self._lock, self._connect() as conn:
+            return self._requeue_or_supersede(
+                conn,
+                job_id,
+                extra_where="AND (? IS NULL OR started_at = ?)",
+                extra_params=(claimed_started_at, claimed_started_at),
+                error_json=json.dumps(error, ensure_ascii=False) if error else None,
+                set_error=True,
+                run_after=float(self.clock()) + max(0.0, delay_seconds),
+            )
 
     def get(self, job_id: str) -> Job:
         with self._lock, self._connect() as conn:
@@ -992,9 +1055,10 @@ def spawn_daemon_detached(
 ) -> bool:
     """Start a daemon for ``palace_path`` in the background; never wait for it.
 
-    Returns True when a process was spawned. Skips the spawn when a daemon is
-    registered and alive, or when another caller spawned one within
-    ``SPAWN_THROTTLE_SECONDS``. The child runs in its own session (POSIX) or
+    Returns True when a process was spawned. Skips the spawn when any process
+    holds the palace's daemon lock, when another launcher is inside this
+    function, or when this function spawned one less than
+    ``SPAWN_THROTTLE_SECONDS`` ago (whether or not it is still alive). The child runs in its own session (POSIX) or
     process group without a console window (Windows; see ``_detached_kwargs``
     for why that is ``CREATE_NO_WINDOW`` rather than ``DETACHED_PROCESS``), so
     it survives the hook and the terminal that ran it.
@@ -1002,39 +1066,49 @@ def spawn_daemon_detached(
     from ._proc import safe_child_env, safe_module_argv
 
     palace_path = canonical_palace_path(palace_path)
-    if daemon_registered_alive(palace_path):
+    # Any holder of the lifetime lock will run what is queued: a registered
+    # daemon, one still starting up, one waiting for the writer lock, and one
+    # exiting idle (which re-checks the queue after it lets the lock go; see
+    # ``daemon._hand_off_late_work``). A second server would only lose the lock.
+    if daemon_lock_held(palace_path):
         return False
     sd = state_dir(palace_path)
     sd.mkdir(parents=True, exist_ok=True)
     _chmod_dir_private(sd)
     stamp = sd / SPAWN_STAMP_NAME
-    try:
-        if not ignore_throttle and time.time() - stamp.stat().st_mtime < SPAWN_THROTTLE_SECONDS:
+    # The lifetime lock admits one server. This separate, short reservation
+    # also admits just one launcher while the server is still importing.
+    with open(sd / "spawn.lock", "a+b") as launch_lock:
+        if not _try_lock_nonblocking(launch_lock):
             return False
-    except OSError:
-        pass
-    try:
-        stamp.touch()
-    except OSError:
-        pass
-    cmd = safe_module_argv(
-        "mempalace.daemon",
-        "serve",
-        "--palace",
-        palace_path,
-        "--idle-exit-default",
-        str(AUTOSTART_IDLE_EXIT_MINUTES),
-    )
-    if backend:
-        cmd.extend(["--backend", backend])
-    env = safe_child_env()
-    kwargs = _detached_kwargs(sd / "daemon.log")
-    try:
-        subprocess.Popen(cmd, env=env, **kwargs)
-    finally:
-        log_fh = kwargs.get("stdout")
-        if hasattr(log_fh, "close"):
-            log_fh.close()
+        if daemon_lock_held(palace_path):
+            return False
+        try:
+            # On age alone: a daemon that dies at startup (bad config, refused
+            # writer lease) must not be respawned by every hook fire.
+            if not ignore_throttle and time.time() - stamp.stat().st_mtime < SPAWN_THROTTLE_SECONDS:
+                return False
+        except OSError:
+            pass
+        cmd = safe_module_argv(
+            "mempalace.daemon",
+            "serve",
+            "--palace",
+            palace_path,
+            "--idle-exit-default",
+            str(AUTOSTART_IDLE_EXIT_MINUTES),
+        )
+        if backend:
+            cmd.extend(["--backend", backend])
+        env = safe_child_env()
+        kwargs = _detached_kwargs(sd / "daemon.log")
+        try:
+            proc = subprocess.Popen(cmd, env=env, **kwargs)
+            _write_private(stamp, str(proc.pid))
+        finally:
+            log_fh = kwargs.get("stdout")
+            if hasattr(log_fh, "close"):
+                log_fh.close()
     return True
 
 
