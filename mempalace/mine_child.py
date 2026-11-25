@@ -351,7 +351,8 @@ def main() -> int:
     _CHANNEL.notify({"op": "started", "pid": os.getpid(), "priority": applied})
     heartbeat = _CHANNEL.start_heartbeat()
     try:
-        _adopt_palace_lock(palace_path)
+        if job.get("lock_held", True):
+            _adopt_palace_lock(palace_path)
         _install_remote_storage()
         from .service import run_mine
 

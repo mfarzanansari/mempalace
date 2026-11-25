@@ -286,3 +286,45 @@ def test_configured_idle_exit_overrides_the_autostart_default(state, monkeypatch
     monkeypatch.delenv("MEMPALACE_DAEMON_IDLE_EXIT_MINUTES")
     assert daemon._resolve_idle_exit_minutes(30) == 30
     assert daemon._resolve_idle_exit_minutes(None) == 0.0
+
+
+def test_registration_left_by_a_dead_daemon_with_a_reused_pid_is_not_alive(state):
+    """A crashed daemon leaves its pid file; once the OS reuses that pid the
+    lifetime-lock probe still shows no daemon, so hooks start a new one."""
+    daemon_queue.state_dir(state).mkdir(parents=True, exist_ok=True)
+    # Our own pid is certainly alive, but we do not hold daemon.lock.
+    daemon_queue.pid_path(state).write_text(f"{os.getpid()}\n")
+    daemon_queue.endpoint_path(state).write_text(json.dumps({"pid": os.getpid(), "port": 1}))
+    assert daemon_queue.daemon_registered_alive(state) is False
+    with daemon_queue.daemon_singleton(state) as won:
+        assert won is True
+        assert daemon_queue.daemon_registered_alive(state) is True
+
+
+def test_a_refused_daemon_start_stops_hooks_from_starting_more(state, monkeypatch):
+    """A daemon refused the palace writer lock (an MCP server owns it) records
+    that; hooks then do not start daemons that would only refuse again, so
+    prefer falls back to its direct path instead of queuing unrunnable work."""
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", state)
+    monkeypatch.setenv("MEMPALACE_HOOK_DAEMON_AUTOSTART", "1")
+    assert hooks_cli._daemon_can_start() is True
+    daemon_queue.record_start_refused(state, "writable daemon startup refused")
+    assert hooks_cli._daemon_can_start() is False
+    daemon_queue.clear_start_refused(state)
+    assert hooks_cli._daemon_can_start() is True
+
+
+def test_run_server_records_a_refused_start(state, monkeypatch):
+    from mempalace import palace
+
+    monkeypatch.setattr(daemon, "backend_requires_single_writer", lambda _b: True)
+
+    @__import__("contextlib").contextmanager
+    def held(_p):
+        raise palace.MineAlreadyRunning("held by PID 1")
+        yield
+
+    monkeypatch.setattr(daemon, "mine_palace_lock", held)
+    with pytest.raises(daemon.DaemonError, match="startup refused"):
+        daemon.run_server(state)
+    assert daemon_queue.start_recently_refused(state) is True

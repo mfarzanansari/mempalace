@@ -1015,6 +1015,31 @@ def test_save_diary_direct_daemon_opt_in_queues_job_without_waiting(tmp_path):
     assert job.payload["hook_ack"]["session_id"] == "sess1"
 
 
+def test_repeated_daemon_checkpoints_for_a_session_coalesce(tmp_path):
+    """Stop hooks that fire before the daemon files a checkpoint replace the
+    pending one (latest wins) instead of queuing overlapping entries."""
+    transcript = tmp_path / "session.jsonl"
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    env = _daemon_env(tmp_path, palace_dir)
+    with patch.dict("os.environ", env):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli._daemon_available", return_value=True):
+                for count in (3, 5):
+                    _write_transcript(
+                        transcript,
+                        [
+                            {"message": {"role": "user", "content": f"message {i}"}}
+                            for i in range(count)
+                        ],
+                    )
+                    _save_diary_direct(
+                        str(transcript), "sess1", agent_name="claude", exchange_count=count
+                    )
+    (job,) = _queued(palace_dir, tmp_path / "daemon_state")
+    assert job.payload["hook_ack"]["exchange_count"] == 5
+
+
 def test_session_start_passes_through(tmp_path):
     result = _capture_hook_output(
         hook_session_start,

@@ -348,3 +348,50 @@ def test_child_that_reports_done_but_never_exits_is_reaped(tmp_path):
     assert result["success"] is True
     assert result["files"] == 1
     assert "did not exit" in result["reaped"]
+
+
+def test_unpicklable_reply_becomes_the_childs_error(tmp_path):
+    """A storage result that cannot cross the pipe fails that one call in the
+    child, which can handle it, instead of crashing the supervisor."""
+    from mempalace import mine_supervisor
+
+    class Unpicklable:
+        def __reduce__(self):
+            raise TypeError("no pickling")
+
+    import io
+    import pickle
+
+    out = io.BytesIO()
+    mine_supervisor._send_reply(out, {"ok": True, "value": Unpicklable()})
+    reply = pickle.loads(out.getvalue()[4:])
+    assert reply["ok"] is False
+    assert "could not send" in str(reply["exc"])
+
+
+def test_child_takes_the_lock_itself_when_the_daemon_does_not_hold_it(tmp_path):
+    """On a backend whose daemon holds no palace lock, the child must not
+    pretend it does, or a daemon mine would stop excluding other miners."""
+    script = textwrap.dedent(
+        """
+        import os, sys
+        from mempalace import mine_child, palace, paths
+        calls = []
+        mine_child._adopt_palace_lock = lambda p: calls.append(p)
+        mine_child._install_remote_storage = lambda: None
+        import mempalace.service as service
+        service.run_mine = lambda payload: {"success": True, "adopted": bool(calls)}
+        sys.exit(mine_child.main())
+        """
+    )
+    for held in (True, False):
+        palace_dir = tmp_path / f"palace_{held}"
+        result = run_mine_in_child(
+            {"palace_path": str(palace_dir)},
+            palace_path=str(palace_dir),
+            write_lock=threading.RLock(),
+            argv=_child_argv(script),
+            lock_held=held,
+        )
+        assert result["success"] is True, result
+        assert result["adopted"] is held

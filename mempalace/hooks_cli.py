@@ -667,13 +667,20 @@ def _daemon_available() -> bool:
 
 
 def _daemon_can_start() -> bool:
-    """Whether this hook may start a daemon: auto-start on, none registered alive."""
+    """Whether this hook may start a daemon.
+
+    Auto-start must be on, no daemon registered alive, and no daemon refused
+    to start in the last minute because another process owns the palace's
+    writer lock -- starting one would only refuse again, so ``prefer`` takes
+    its direct path instead of queuing work nothing will run.
+    """
     if not _daemon_autostart_enabled():
         return False
-    from .daemon_queue import daemon_registered_alive
+    from .daemon_queue import daemon_registered_alive, start_recently_refused
 
     try:
-        return not daemon_registered_alive(MempalaceConfig().palace_path)
+        palace = MempalaceConfig().palace_path
+        return not daemon_registered_alive(palace) and not start_recently_refused(palace)
     except Exception:
         return False
 
@@ -1420,6 +1427,11 @@ def _save_diary_direct(
                         },
                     },
                     priority=10,
+                    # One pending checkpoint per session: the save marker only
+                    # moves once the daemon files it, so Stop hooks that fire
+                    # meanwhile would otherwise each queue an overlapping one.
+                    # Latest wins; it covers the most messages.
+                    dedupe_key=f"hook:diary:{_sanitize_session_id(session_id)}",
                 )
             except Exception as exc:
                 # The row may be committed — don't fall back (would double-write).
@@ -2011,7 +2023,12 @@ def hook_session_end(data: dict, harness: str):
 
 
 def hook_precompact(data: dict, harness: str):
-    """Precompact hook: mine transcript synchronously, then allow compaction.
+    """Precompact hook: mine the transcript, then allow compaction.
+
+    On the direct route the mine runs synchronously before compaction. On the
+    daemon route it is queued as an immediate job and not waited on: the
+    transcript file stays on disk, so compaction loses nothing the queued
+    mine will not read.
 
     Respects the ``hooks.auto_save`` config toggle — when disabled, returns
     immediately without mining.

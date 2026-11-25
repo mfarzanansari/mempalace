@@ -874,8 +874,31 @@ def _try_lock_nonblocking(fh) -> bool:
         return False
 
 
+def _unlock(fh) -> None:
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - Windows
+        fcntl = None
+    try:
+        if fcntl is not None:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        else:  # pragma: no cover - Windows
+            import msvcrt
+
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass
+
+
+# How long a starting daemon keeps trying for the lifetime lock. Long enough
+# to ride out a hook's momentary probe of it (``daemon_lock_held``), short
+# enough that the loser of a real start race exits quickly.
+SINGLETON_RETRY_SECONDS = 2.0
+
+
 @contextlib.contextmanager
-def daemon_singleton(palace_path: str):
+def daemon_singleton(palace_path: str, *, retry_seconds: float = SINGLETON_RETRY_SECONDS):
     """Hold this palace's daemon lifetime lock; yield whether it was won.
 
     The OS drops the lock when the holder exits, however it exits, so a
@@ -887,26 +910,86 @@ def daemon_singleton(palace_path: str):
     fh = open(sd / DAEMON_LOCK_NAME, "a+")
     try:
         _chmod_private(sd / DAEMON_LOCK_NAME)
-        yield _try_lock_nonblocking(fh)
+        won = _try_lock_nonblocking(fh)
+        deadline = time.monotonic() + retry_seconds
+        while not won and time.monotonic() < deadline:
+            time.sleep(0.05)
+            won = _try_lock_nonblocking(fh)
+        yield won
+    finally:
+        fh.close()
+
+
+def daemon_lock_held(palace_path: str) -> bool:
+    """Whether some process holds this palace's daemon lifetime lock.
+
+    Probes the lock without waiting and drops it at once if it was free. A
+    daemon starting at that instant retries for ``SINGLETON_RETRY_SECONDS``,
+    so the probe cannot cost it the start.
+    """
+    path = state_dir(palace_path) / DAEMON_LOCK_NAME
+    try:
+        fh = open(path, "r+")
+    except OSError:
+        return False  # no daemon has ever run for this palace
+    try:
+        if _try_lock_nonblocking(fh):
+            _unlock(fh)
+            return False
+        return True
     finally:
         fh.close()
 
 
 def daemon_registered_alive(palace_path: str) -> bool:
-    """True when a daemon registration exists and its pid is alive.
+    """True when a daemon is registered, its pid is alive, and it holds the lock.
 
-    A file read and a signal-0 probe: no HTTP, so a hook can afford it. A
-    registration whose pid was reused is caught by ``daemon start``'s fuller
-    check; here a false positive only means the job waits in the durable
-    queue for the next daemon instead of starting one now.
+    A file read, a signal-0 probe and a lock probe: no HTTP, so a hook can
+    afford it. The lock probe catches a registration a crashed daemon left
+    behind whose pid the OS has since given to another process.
     """
     from ._proc import pid_alive
 
     pid = _registered_pid(palace_path)
-    return pid is not None and pid_alive(pid)
+    if pid is None or not pid_alive(pid):
+        return False
+    return daemon_lock_held(palace_path)
 
 
-def spawn_daemon_detached(palace_path: str, *, backend: str | None = None) -> bool:
+# Written by a daemon that could not take the palace's writer lock (another
+# writer owns a single-writer backend). Hooks stop starting daemons that would
+# only refuse again, and ``prefer`` falls back to its direct path.
+START_REFUSED_NAME = "start.refused"
+START_REFUSED_TTL_SECONDS = 60.0
+
+
+def record_start_refused(palace_path: str, message: str) -> None:
+    try:
+        sd = state_dir(palace_path)
+        sd.mkdir(parents=True, exist_ok=True)
+        _write_private(sd / START_REFUSED_NAME, json.dumps({"ts": time.time(), "error": message}))
+    except OSError:
+        pass
+
+
+def clear_start_refused(palace_path: str) -> None:
+    try:
+        (state_dir(palace_path) / START_REFUSED_NAME).unlink()
+    except OSError:
+        pass
+
+
+def start_recently_refused(palace_path: str) -> bool:
+    try:
+        age = time.time() - (state_dir(palace_path) / START_REFUSED_NAME).stat().st_mtime
+    except OSError:
+        return False
+    return age < START_REFUSED_TTL_SECONDS
+
+
+def spawn_daemon_detached(
+    palace_path: str, *, backend: str | None = None, ignore_throttle: bool = False
+) -> bool:
     """Start a daemon for ``palace_path`` in the background; never wait for it.
 
     Returns True when a process was spawned. Skips the spawn when a daemon is
@@ -926,7 +1009,7 @@ def spawn_daemon_detached(palace_path: str, *, backend: str | None = None) -> bo
     _chmod_dir_private(sd)
     stamp = sd / SPAWN_STAMP_NAME
     try:
-        if time.time() - stamp.stat().st_mtime < SPAWN_THROTTLE_SECONDS:
+        if not ignore_throttle and time.time() - stamp.stat().st_mtime < SPAWN_THROTTLE_SECONDS:
             return False
     except OSError:
         pass
