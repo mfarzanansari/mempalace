@@ -151,6 +151,7 @@ def run_mine_in_child(
     stall_seconds: float = DEFAULT_STALL_SECONDS,
     exit_grace_seconds: float = DEFAULT_EXIT_GRACE_SECONDS,
     lock_held: bool = True,
+    kind: str = "mine",
 ) -> dict:
     """Run one mine job in a child process; return the job result.
 
@@ -164,7 +165,8 @@ def run_mine_in_child(
     ``lock_held`` says whether this process holds the palace write lock for
     the job, so the child may treat it as held; otherwise the child's mine
     takes the lock itself. ``argv`` overrides the child command (tests use a
-    fake child).
+    fake child). ``kind`` is ``mine`` or ``hallways`` (a deferred whole-wing
+    hallway recompute, which reads drawers through the same channel).
     """
     from .palace import _validate_palace_fts5_after_mine, get_collection, palace_write_serial
 
@@ -187,7 +189,7 @@ def run_mine_in_child(
     result: Optional[dict] = None
     try:
         try:
-            _write_msg(proc.stdin, {"payload": payload, "lock_held": lock_held})
+            _write_msg(proc.stdin, {"kind": kind, "payload": payload, "lock_held": lock_held})
         except (BrokenPipeError, OSError):
             pass  # died before reading its job; reported below from the exit code
         while True:

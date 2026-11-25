@@ -354,9 +354,14 @@ def main() -> int:
         if job.get("lock_held", True):
             _adopt_palace_lock(palace_path)
         _install_remote_storage()
-        from .service import run_mine
+        if job.get("kind") == "hallways":
+            from .service import run_hallways
 
-        result = run_mine(payload)
+            result = run_hallways(payload)
+        else:
+            from .service import run_mine
+
+            result = run_mine(payload)
     except BaseException as exc:  # noqa: BLE001 - report every failure to the daemon
         result = {
             "success": False,

@@ -62,6 +62,11 @@ _NOT_SEARCH_SETTINGS = {
     "MEMPALACE_DAEMON_MINE_CHILD",
     "MEMPALACE_DAEMON_MINE_STALL_SECONDS",
     "MEMPALACE_DAEMON_MINE_THREADS",
+    # When a mine's hallway recompute runs (inline or deferred, and how long
+    # the deferral settles): hallway records only, never drawers or ranking.
+    "MEMPALACE_HALLWAYS_DEFER",
+    "MEMPALACE_HALLWAYS_MAX_WAIT_SECONDS",
+    "MEMPALACE_HALLWAYS_SETTLE_SECONDS",
     "MEMPALACE_ORT_ALLOW_SPINNING",
     # Pick the palace or the config file; the hub is looked up per palace and
     # the fingerprint hashes the values that file resolves to.

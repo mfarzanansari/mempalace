@@ -188,6 +188,7 @@ class DaemonRuntime:
 
     def start_worker(self) -> threading.Thread:
         self.store.recover_running()
+        self._queue_dirty_hallways()
         # Bounded growth: drop terminal jobs older than the retention window
         # before bringing the worker up. Best-effort — a prune failure must not
         # block startup.
@@ -272,12 +273,31 @@ class DaemonRuntime:
             }
             return set(self._deferred_until)
 
+    def _queue_dirty_hallways(self, wing: str | None = None) -> None:
+        """Queue the deferred hallway recompute of every dirty wing (or ``wing``).
+
+        At start this picks up marks a crash or a daemon-less mine left; after a
+        ``hallways`` job it re-queues a mark the job did not clear (it failed,
+        was killed, or a mine marked the wing again), so a long-running daemon
+        never leaves a wing stale until the next mine. Best-effort: the mark is
+        durable either way.
+        """
+        try:
+            from .hallway_refresh import enqueue_dirty_wings, schedule
+
+            if wing is None:
+                enqueue_dirty_wings(self.palace_path, store=self.store)
+            else:
+                schedule(wing, self.palace_path, store=self.store)
+        except Exception:  # noqa: BLE001 - scheduling must never stop the daemon
+            pass
+
     def _run_job(self, job: Job, payload: dict) -> dict:
         from .config import MempalaceConfig
         from .service import execute_job
 
         config = MempalaceConfig()
-        if job.kind == "mine" and config.daemon_mine_child:
+        if job.kind in ("mine", "hallways") and config.daemon_mine_child:
             from .mine_supervisor import run_mine_in_child
 
             def _attach(child) -> None:
@@ -293,6 +313,7 @@ class DaemonRuntime:
                     argv=self.mine_child_argv,
                     stall_seconds=config.daemon_mine_stall_seconds,
                     lock_held=self.holds_palace_lock,
+                    kind=job.kind,
                 )
             finally:
                 self.active_child = None
@@ -371,6 +392,8 @@ class DaemonRuntime:
             finally:
                 self.active_jobs.pop(lane, None)
                 self._last_busy = time.monotonic()
+            if job.kind == "hallways" and isinstance(job.payload.get("wing"), str):
+                self._queue_dirty_hallways(job.payload["wing"])
 
 
 def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
