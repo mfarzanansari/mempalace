@@ -1836,6 +1836,26 @@ class MempalaceConfig:
             return 60.0
 
     @property
+    def daemon_idle_exit_minutes(self) -> "float | None":
+        """Minutes with an empty queue after which the daemon exits, if set.
+
+        Env ``MEMPALACE_DAEMON_IDLE_EXIT_MINUTES`` > config
+        ``daemon.idle_exit_minutes``; ``0`` never exits. ``None`` when neither
+        is set: a hook-started daemon then exits after 30 idle minutes (the
+        next hook starts it again), and ``mempalace daemon start`` keeps
+        running.
+        """
+        raw = os.environ.get("MEMPALACE_DAEMON_IDLE_EXIT_MINUTES")
+        if raw is None:
+            raw = self._daemon_section().get("idle_exit_minutes")
+        if raw is None or str(raw).strip() == "":
+            return None
+        try:
+            return max(0.0, float(str(raw).strip()))
+        except (TypeError, ValueError):
+            return None
+
+    @property
     def hook_use_daemon(self):
         """Whether hooks should submit save/mine work to the opt-in daemon."""
         flag = env_flag("MEMPALACE_HOOKS_DAEMON")

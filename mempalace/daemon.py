@@ -168,6 +168,7 @@ class DaemonRuntime:
         # re-claimed. Each lane only touches its own jobs' entries.
         self._deferred_until: dict[str, float] = {}
         self._deferred_lock = threading.Lock()
+        self._last_busy = time.monotonic()
 
     @property
     def active_job_id(self) -> str | None:
@@ -208,6 +209,22 @@ class DaemonRuntime:
 
     def alive_workers(self) -> list[threading.Thread]:
         return [thread for thread in self.worker_threads.values() if thread.is_alive()]
+
+    def idle_seconds(self) -> float:
+        """How long nothing has been running or waiting in the queue."""
+        now = time.monotonic()
+        if self.active_jobs:
+            self._last_busy = now
+            return 0.0
+        try:
+            queued = self.store.counts().get("queued", 0)
+        except Exception:  # noqa: BLE001 - an unreadable queue is not idleness
+            queued = 1
+        if queued:
+            # A debounced job not yet due still keeps the daemon up to run it.
+            self._last_busy = now
+            return 0.0
+        return now - self._last_busy
 
     def progress(self) -> dict | None:
         child = self.active_child
@@ -344,6 +361,7 @@ class DaemonRuntime:
                 )
             finally:
                 self.active_jobs.pop(lane, None)
+                self._last_busy = time.monotonic()
 
 
 def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
@@ -483,7 +501,46 @@ def _ensure_lifecycle_logging() -> None:
     _lifecycle_logging_ready = True
 
 
-def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -> None:  # noqa: C901
+def _resolve_idle_exit_minutes(default: float | None) -> float:
+    try:
+        from .config import MempalaceConfig
+
+        configured = MempalaceConfig().daemon_idle_exit_minutes
+    except Exception:  # noqa: BLE001 - a bad config must not stop the daemon
+        configured = None
+    if configured is not None:
+        return configured
+    return default or 0.0
+
+
+def _start_idle_exit_watch(runtime: "DaemonRuntime", httpd, idle_minutes: float) -> None:
+    """Stop serving once the queue has been empty for ``idle_minutes``."""
+    limit = idle_minutes * 60.0
+    tick = max(0.05, min(10.0, limit / 4))
+
+    def watch() -> None:
+        while not runtime.shutdown_event.wait(tick):
+            if runtime.idle_seconds() >= limit:
+                _LIFECYCLE_LOGGER.info("idle for %g min with an empty queue; exiting", idle_minutes)
+                runtime.shutdown_event.set()
+                httpd.shutdown()
+                return
+
+    threading.Thread(target=watch, name="mempalace-daemon-idle-exit", daemon=True).start()
+
+
+def run_server(  # noqa: C901
+    palace_path: str,
+    *,
+    backend: str | None = None,
+    port: int = 0,
+    idle_exit_minutes: float | None = None,
+) -> None:
+    """Serve the palace's queue until shutdown.
+
+    ``idle_exit_minutes`` is the default idle exit when config sets none
+    (``daemon.idle_exit_minutes``); ``None`` or ``0`` keeps serving.
+    """
     palace_path = canonical_palace_path(palace_path)
     previous_env = {
         "MEMPALACE_PALACE_PATH": os.environ.get("MEMPALACE_PALACE_PATH"),
@@ -695,6 +752,9 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
                 palace_path,
             )
             runtime.start_worker()
+            idle_minutes = _resolve_idle_exit_minutes(idle_exit_minutes)
+            if idle_minutes > 0:
+                _start_idle_exit_watch(runtime, httpd, idle_minutes)
             try:
                 httpd.serve_forever(poll_interval=0.5)
             finally:
@@ -1278,7 +1338,12 @@ def stop_daemon(palace_path: str) -> bool:
 
 def _cmd_serve(args) -> None:
     try:
-        run_server(args.palace, backend=args.backend, port=args.port)
+        run_server(
+            args.palace,
+            backend=args.backend,
+            port=args.port,
+            idle_exit_minutes=args.idle_exit_default,
+        )
     except DaemonAlreadyRunning as exc:
         # Losing the start race is the expected outcome of two hooks spawning
         # at once, not an error: the winner serves the queue.
@@ -1294,6 +1359,8 @@ def main(argv: list[str] | None = None) -> None:
     serve.add_argument("--palace", required=True)
     serve.add_argument("--backend", default=None)
     serve.add_argument("--port", type=int, default=0)
+    # Idle exit when config sets none; hooks pass 30 for the daemon they start.
+    serve.add_argument("--idle-exit-default", type=float, default=None)
     args = parser.parse_args(argv)
     if args.command == "serve":
         _cmd_serve(args)

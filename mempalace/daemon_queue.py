@@ -842,6 +842,9 @@ SPAWN_STAMP_NAME = "spawn.stamp"
 # window skip the spawn instead of each paying for a Python start that would
 # only lose the lock race.
 SPAWN_THROTTLE_SECONDS = 10.0
+# A daemon a hook started exits after this many minutes with nothing to do,
+# unless daemon.idle_exit_minutes says otherwise; the next hook restarts it.
+AUTOSTART_IDLE_EXIT_MINUTES = 30
 # ``serve`` exit status when another daemon already owns this palace.
 EXIT_ALREADY_RUNNING = 0
 
@@ -931,7 +934,14 @@ def spawn_daemon_detached(palace_path: str, *, backend: str | None = None) -> bo
         stamp.touch()
     except OSError:
         pass
-    cmd = safe_module_argv("mempalace.daemon", "serve", "--palace", palace_path)
+    cmd = safe_module_argv(
+        "mempalace.daemon",
+        "serve",
+        "--palace",
+        palace_path,
+        "--idle-exit-default",
+        str(AUTOSTART_IDLE_EXIT_MINUTES),
+    )
     if backend:
         cmd.extend(["--backend", backend])
     env = safe_child_env()
