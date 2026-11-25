@@ -38,6 +38,7 @@ from .daemon_queue import (  # noqa: F401 - re-exported for existing callers
     LOCK_REFUSAL_ERROR_CLASS,
     MAX_ATTEMPTS,
     QUEUE_SCHEMA_VERSION,
+    SPAWN_STAMP_NAME,
     STATE_ROOT_ENV,
     SUPERSEDED_ERROR_CLASS,
     TERMINAL_STATES,
@@ -55,6 +56,7 @@ from .daemon_queue import (  # noqa: F401 - re-exported for existing callers
     _write_private,
     canonical_palace_path,
     clear_start_refused,
+    daemon_lock_held,
     daemon_registered_alive,
     daemon_singleton,
     endpoint_path,
@@ -100,6 +102,15 @@ def _lock_defer_backoff_seconds() -> float:
 LOCK_DEFER_BACKOFF_SECONDS = _lock_defer_backoff_seconds()
 MAX_BODY_BYTES = 1 << 20  # 1 MiB cap on request bodies (auth-gated DoS guard)
 SHUTDOWN_DRAIN_SECONDS = 10.0
+# A mine whose child was killed or died is retried (it is idempotent per
+# file), this many seconds times the attempt number later, until the job's
+# MAX_ATTEMPTS claims are spent.
+MINE_RETRY_BACKOFF_SECONDS = 30.0
+# How long a hook-started daemon keeps retrying a writer lease another process
+# holds, while jobs are queued, before it gives up and exits.
+WRITER_LEASE_WAIT_SECONDS = 600.0
+# Results of a mine cut short in its child rather than failed by the mine.
+MINE_CHILD_CUT_SHORT = ("MineChildKilled", "MineChildDied")
 try:
     import fcntl as _fcntl  # POSIX only; absent on Windows
 except ImportError:  # pragma: no cover - Windows fallback
@@ -259,6 +270,23 @@ class DaemonRuntime:
             # would eventually dead-letter it.)
             pass
 
+    def _safe_retry(
+        self,
+        job: Job,
+        *,
+        delay_seconds: float,
+        error: dict,
+    ) -> bool:
+        try:
+            return self.store.retry(
+                job.id,
+                claimed_started_at=job.started_at,
+                delay_seconds=delay_seconds,
+                error=error,
+            )
+        except Exception:  # noqa: BLE001 - a retry failure must not kill the worker
+            return False
+
     def _cooling_job_ids(self) -> set[str]:
         """Ids of jobs still inside their post-refusal cooldown.
 
@@ -277,7 +305,9 @@ class DaemonRuntime:
         from .service import execute_job
 
         config = MempalaceConfig()
-        if job.kind == "mine" and config.daemon_mine_child:
+        # Third-party adapters receive a writable KnowledgeGraph and can store
+        # media outside the collection API. They need the in-process writer.
+        if job.kind == "mine" and config.daemon_mine_child and not payload.get("source_adapter"):
             from .mine_supervisor import run_mine_in_child
 
             def _attach(child) -> None:
@@ -348,6 +378,24 @@ class DaemonRuntime:
                     # caller would hang.
                     with self._deferred_lock:
                         self._deferred_until[job.id] = time.monotonic() + LOCK_DEFER_BACKOFF_SECONDS
+                    continue
+                if (
+                    not ok
+                    and job.kind == "mine"
+                    and result.get("error_class") in MINE_CHILD_CUT_SHORT
+                    and job.attempts < MAX_ATTEMPTS
+                    and self._safe_retry(
+                        job,
+                        delay_seconds=MINE_RETRY_BACKOFF_SECONDS * job.attempts,
+                        error={
+                            "error_class": result["error_class"],
+                            "message": result.get("error", "mine child cut short"),
+                        },
+                    )
+                ):
+                    # Writes the child asked for are whole and stay; the rerun
+                    # redoes the files it did not finish. A newer queued run
+                    # of the same source supersedes this one instead.
                     continue
                 state = "succeeded" if ok else "failed"
                 error = None
@@ -578,19 +626,35 @@ def run_server(  # noqa: C901
             raise DaemonAlreadyRunning(f"a daemon is already running for {palace_path!r}")
         resolved_backend = resolve_backend_name(palace_path, explicit=backend)
         if backend_requires_single_writer(resolved_backend):
-            try:
-                writer_lease.enter_context(mine_palace_lock(palace_path))
-            except MineAlreadyRunning as exc:
-                message = (
-                    "writable daemon startup refused: another writer owns "
-                    f"local backend {resolved_backend!r} for {palace_path!r}; "
-                    "stop the existing writable MCP/direct/daemon owner, or "
-                    "route all writes through that owner"
-                )
-                # Hooks read this and stop starting daemons that would only
-                # refuse again; ``prefer`` then takes its direct path.
-                record_start_refused(palace_path, message)
-                raise DaemonError(message) from exc
+            delay = 1.0
+            lease_deadline = time.monotonic() + WRITER_LEASE_WAIT_SECONDS
+            while True:
+                try:
+                    writer_lease.enter_context(mine_palace_lock(palace_path))
+                    break
+                except MineAlreadyRunning as exc:
+                    message = (
+                        "writable daemon startup refused: another writer owns "
+                        f"local backend {resolved_backend!r} for {palace_path!r}; "
+                        "stop the existing writable MCP/direct/daemon owner, or "
+                        "route all writes through that owner"
+                    )
+                    # Hooks read this and stop starting daemons that would only
+                    # refuse again; ``prefer`` then takes its direct path.
+                    record_start_refused(palace_path, message)
+                    # A hook has already committed its job. Retain the daemon
+                    # singleton and retry the writer lease without another hook,
+                    # for a bounded time: a writer that never lets go must not
+                    # leave an unregistered daemon holding the singleton forever.
+                    # The job stays queued for the next daemon.
+                    if (
+                        idle_exit_minutes is None
+                        or time.monotonic() >= lease_deadline
+                        or not QueueStore(queue_path(palace_path)).counts().get("queued")
+                    ):
+                        raise DaemonError(message) from exc
+                    time.sleep(delay)
+                    delay = min(delay * 2, 30)
         holds_palace_lock = backend_requires_single_writer(resolved_backend)
         clear_start_refused(palace_path)
 
@@ -813,7 +877,8 @@ def _drain_and_cleanup(
     DELETE) violates incremental-only. Give the worker a bounded window to
     finish, then mark whatever is still running as cancelled so recover_running
     won't blindly re-run it on the next start (which would duplicate verbatim
-    content). Finally restore the env vars run_server mutated.
+    content). The one exception is a mine run in a child, which is re-queued
+    (see below). Finally restore the env vars run_server mutated.
     """
     runtime.shutdown_event.set()
     child = runtime.active_child
@@ -822,14 +887,23 @@ def _drain_and_cleanup(
         # here, whole. Stopping it first loses no stored data -- the next mine
         # resumes where it stopped -- and frees the main lane at once instead
         # of serving the child's writes through the whole drain window.
+        # The mine goes back to the queue for the next daemon: a
+        # file-idempotent mine is safe to redo. The interrupted run still
+        # counts as an attempt, so a mine that ``daemon stop`` keeps cutting
+        # short is dead-lettered after MAX_ATTEMPTS rather than restarted by
+        # every later daemon; the next hook for its source queues a fresh one.
+        # A newer queued run of the source supersedes it.
         main_job = runtime.active_jobs.get("main")
         if main_job:
-            runtime._safe_finish(
-                main_job,
-                state="cancelled",
-                result={"success": False, "exit_code": 1},
-                error={"message": "cancelled by daemon shutdown"},
-            )
+            try:
+                if runtime.store.get(main_job).attempts < MAX_ATTEMPTS:
+                    runtime.store.retry(
+                        main_job,
+                        claimed_started_at=None,
+                        error={"message": "interrupted by daemon shutdown; re-queued"},
+                    )
+            except Exception:  # noqa: BLE001 - recover_running re-queues it at next start
+                pass
         child.kill("daemon shutdown")
     deadline = time.monotonic() + SHUTDOWN_DRAIN_SECONDS
     for worker in list(runtime.worker_threads.values()):
@@ -841,7 +915,11 @@ def _drain_and_cleanup(
             result={"success": False, "exit_code": 1},
             error={"message": "cancelled by daemon shutdown"},
         )
-    for stale in (endpoint_path(palace_path), pid_path(palace_path)):
+    for stale in (
+        state_dir(palace_path) / SPAWN_STAMP_NAME,
+        endpoint_path(palace_path),
+        pid_path(palace_path),
+    ):
         try:
             stale.unlink()
         except OSError:
@@ -1190,7 +1268,11 @@ def _remove_registration(palace_path: str, *, expected_pid: int | None = None) -
     """
     if expected_pid is not None and _registered_pid(palace_path) != expected_pid:
         return
-    for stale in (endpoint_path(palace_path), pid_path(palace_path)):
+    for stale in (
+        state_dir(palace_path) / SPAWN_STAMP_NAME,
+        endpoint_path(palace_path),
+        pid_path(palace_path),
+    ):
         try:
             stale.unlink()
         except OSError:
@@ -1254,7 +1336,12 @@ def start_daemon(
     # replaced below.
     _refuse_live_registration(palace_path)
 
-    _remove_registration(palace_path)
+    # A daemon a hook started may have taken the lifetime lock since the
+    # probe above and be about to register, or have just registered. Its
+    # registration is not stale; the server spawned below loses the lock and
+    # exits 0, and the loop waits for that daemon to answer instead.
+    if not daemon_lock_held(palace_path):
+        _remove_registration(palace_path)
     # Started from the caller's cwd, which may be an untrusted checkout: run
     # the installed module, never one planted in the working directory.
     cmd = _safe_module_argv("mempalace.daemon", "serve", "--palace", palace_path)
