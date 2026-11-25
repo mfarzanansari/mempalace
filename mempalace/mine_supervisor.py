@@ -5,6 +5,7 @@ client. :func:`run_mine_in_child` starts ``mempalace.mine_child`` at idle
 priority, hands it the job, and serves its storage calls one at a time under
 ``write_lock`` -- the lock every other daemon write (a diary entry) also takes,
 so those land between the mine's calls rather than after the whole mine.
+Writes to the sidecar stores, which hold their own file locks, skip it.
 
 Every message from the child is a heartbeat (``MineChild.last_progress``); the
 child can be killed from another thread (``MineChild.kill``) without taking
@@ -13,11 +14,13 @@ the daemon down, which an in-process mine cannot offer.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import pickle
 import subprocess
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from ._proc import safe_child_env, safe_module_argv
@@ -31,6 +34,10 @@ _ITER_PAGE = 2000
 DEFAULT_STALL_SECONDS = 60.0
 # A child that reported done but has not exited after this long is killed.
 DEFAULT_EXIT_GRACE_SECONDS = 30.0
+# A child that keeps heartbeating but makes no progress (no storage call, no
+# embedded slice) is killed once it has burned this many multiples of the
+# stall limit in CPU-seconds: a pure-Python loop that never returns.
+CPU_STALL_FACTOR = 5.0
 
 
 def _child_env(palace_path: str, threads: int) -> dict:
@@ -87,6 +94,10 @@ class MineChild:
         self.pid = proc.pid
         self.started = time.monotonic()
         self.last_progress = self.started
+        # Last time the mine did work: a storage call or an embedded slice.
+        # A heartbeat alone moves ``last_progress`` but not this.
+        self.last_work = self.started
+        self.work_units = 0
         self.calls = 0
         self.priority: Optional[str] = None
         self.done_at: Optional[float] = None
@@ -151,6 +162,8 @@ def run_mine_in_child(
     stall_seconds: float = DEFAULT_STALL_SECONDS,
     exit_grace_seconds: float = DEFAULT_EXIT_GRACE_SECONDS,
     lock_held: bool = True,
+    cpu_stall_seconds: Optional[float] = None,
+    proc_sampler: Optional[Callable[[int], Optional[tuple]]] = None,
 ) -> dict:
     """Run one mine job in a child process; return the job result.
 
@@ -165,7 +178,15 @@ def run_mine_in_child(
     the job, so the child may treat it as held; otherwise the child's mine
     takes the lock itself. ``argv`` overrides the child command (tests use a
     fake child).
+
+    ``cpu_stall_seconds`` (default ``CPU_STALL_FACTOR`` x ``stall_seconds``)
+    bounds a child that heartbeats but does no work: once it has spent that
+    long, in wall time and in CPU time, since its last storage call or
+    embedded slice, it is killed. ``proc_sampler`` reads a child's CPU ticks
+    and whether any of its threads is runnable (see ``_sample_proc``).
     """
+    if cpu_stall_seconds is None:
+        cpu_stall_seconds = CPU_STALL_FACTOR * stall_seconds if stall_seconds else 0.0
     from .palace import _validate_palace_fts5_after_mine, get_collection, palace_write_serial
 
     cmd = argv or safe_module_argv("mempalace.mine_child")
@@ -177,7 +198,7 @@ def run_mine_in_child(
     if stall_seconds and stall_seconds > 0:
         threading.Thread(
             target=_reap_stalled,
-            args=(child, stall_seconds, reaper_stop),
+            args=(child, stall_seconds, reaper_stop, proc_sampler or _sample_proc),
             name="mempalace-mine-reaper",
             daemon=True,
         ).start()
@@ -201,6 +222,23 @@ def run_mine_in_child(
                 child.priority = msg.get("priority")
                 continue
             if op == "progress":
+                # A heartbeat proves the child is scheduled, not that the mine
+                # moves: its own thread beats on while the mine spins. Work is
+                # a storage call or an embedded slice (``units``).
+                units = msg.get("units", 0)
+                if units != child.work_units:
+                    child.work_units = units
+                    child.last_work = child.last_progress
+                elif (
+                    cpu_stall_seconds > 0
+                    and child.last_progress - child.last_work > cpu_stall_seconds
+                    and msg.get("compute_cpu", 0) > cpu_stall_seconds
+                ):
+                    child.kill(
+                        f"mine child spent {msg.get('compute_cpu', 0):.0f} CPU-s without "
+                        f"progress (limit {cpu_stall_seconds:g} s)"
+                    )
+                    break
                 continue
             if op == "done":
                 result = dict(msg.get("result") or {})
@@ -209,7 +247,10 @@ def run_mine_in_child(
             child.calls += 1
             child.serving = True
             try:
-                with write_lock:
+                # Sidecar stores (origin, revisions, hallways, tunnels) each
+                # hold their own cross-process file lock and never touch the
+                # collection, so they don't hold up the diary lane.
+                with contextlib.nullcontext() if op in _SIDECAR_OPS else write_lock:
                     value = _serve(
                         op,
                         msg,
@@ -225,6 +266,7 @@ def run_mine_in_child(
                 reply = {"ok": False, "exc": _picklable_exc(exc)}
             finally:
                 child.last_progress = time.monotonic()
+                child.last_work = child.last_progress
                 child.serving = False
             try:
                 _send_reply(proc.stdin, reply)
@@ -264,17 +306,66 @@ def run_mine_in_child(
     return result
 
 
-def _reap_stalled(child: MineChild, stall_seconds: float, stop: threading.Event) -> None:
+def _sample_proc(pid: int) -> Optional[tuple]:
+    """``(cpu_ticks, any_thread_runnable)`` for ``pid``; None where unknown.
+
+    Linux only (``/proc``). ``cpu_ticks`` is the process's utime + stime, so
+    it includes threads that have exited; the run state is read per thread.
+    """
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_bytes().rsplit(b")", 1)[1].split()
+        ticks = int(fields[11]) + int(fields[12])
+        runnable = False
+        for task in Path(f"/proc/{pid}/task").iterdir():
+            try:
+                state = (task / "stat").read_bytes().rsplit(b")", 1)[1].split()[0]
+            except (OSError, IndexError):
+                continue  # the thread exited while we listed it
+            runnable = runnable or state == b"R"
+        return ticks, runnable
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _reap_stalled(
+    child: MineChild,
+    stall_seconds: float,
+    stop: threading.Event,
+    sampler: Callable[[int], Optional[tuple]] = _sample_proc,
+) -> None:
+    """Kill the child once it has been silent for ``stall_seconds``.
+
+    A ``SCHED_IDLE`` child runs only when no other process wants the CPU, so
+    on a saturated machine it can go silent without being wedged. Silence is
+    spared when the child is *starved*: its CPU time has not moved since it
+    last spoke and one of its threads is runnable, waiting for a CPU. Silence
+    with flat CPU and no runnable thread is a child blocked for good (a native
+    hang holding the GIL), and silence with CPU advancing is one spinning:
+    both are killed.
+    """
     tick = min(1.0, stall_seconds / 4)
+    baseline = None
+    last_seen = None
     while not stop.wait(tick):
         if child.proc.poll() is not None:
             return
+        sample = sampler(child.pid) if child.priority == "sched-idle" else None
+        if last_seen != child.last_progress:
+            last_seen = child.last_progress
+            baseline = sample[0] if sample else None
         silent = child.stalled_for(time.monotonic())
+        if sample is not None and baseline is not None and sample[1] and sample[0] == baseline:
+            continue  # starved by busier processes, not stuck
         if silent > stall_seconds:
             child.kill(
                 f"mine child sent nothing for {silent:.0f} s (stall limit {stall_seconds:g} s)"
             )
             return
+
+
+_SIDECAR_OPS = frozenset(
+    {"redetect_origin", "revisions", "store_hallways", "topic_tunnels", "entity_tunnels"}
+)
 
 
 def _serve(op, msg, palace_path, handles, gens, writes_at_start, get_collection, validate):
@@ -305,6 +396,25 @@ def _serve(op, msg, palace_path, handles, gens, writes_at_start, get_collection,
                 return {"items": items, "done": False}
         del gens[msg["gen"]]
         return {"items": items, "done": True}
+    if op == "redetect_origin":
+        from .cli import _run_pass_zero
+
+        return _run_pass_zero(project_dir=msg["source"], palace_dir=palace_path, llm_provider=None)
+    if op == "revisions":
+        from .revisions import append_drawer_revisions
+
+        return append_drawer_revisions(palace_path, msg["rows"])
+    if op in {"store_hallways", "topic_tunnels", "entity_tunnels"}:
+        from .config import MempalaceConfig
+        from .hallways import _store_wing_hallways
+        from .miner import _compute_entity_tunnels_for_wing, _compute_topic_tunnels_for_wing
+
+        config = MempalaceConfig(palace_path=palace_path)
+        if op == "store_hallways":
+            return _store_wing_hallways(*msg["args"], config=config)
+        if op == "topic_tunnels":
+            return _compute_topic_tunnels_for_wing(msg["wing"], config=config)
+        return _compute_entity_tunnels_for_wing(msg["wing"], config=config)
     if op == "validate":
         return validate(palace_path, writes_since=writes_at_start)
     raise ValueError(f"unknown mine channel op: {op!r}")
@@ -314,15 +424,8 @@ def _caps(coll, palace_path, backend) -> dict:
     from .backends.embedding_wrapper import EmbeddingCollection
 
     inner = coll._inner if isinstance(coll, EmbeddingCollection) else coll
-    server_embedder = False
-    try:
-        from .palace.backend import get_backend_for_palace
+    from .palace import _backend_has_server_embedder
 
-        server_embedder = (
-            "server_embedder" in get_backend_for_palace(palace_path, explicit=backend).capabilities
-        )
-    except Exception:
-        pass
     methods = sorted(
         name
         for name in dir(inner)
@@ -332,6 +435,6 @@ def _caps(coll, palace_path, backend) -> dict:
         "iter_metadata": hasattr(inner, "iter_metadata"),
         "upsert_merges_metadata": bool(getattr(coll, "upsert_merges_metadata", False)),
         "distance_metric": getattr(coll, "distance_metric", "cosine"),
-        "server_embedder": server_embedder,
+        "server_embedder": _backend_has_server_embedder(palace_path, backend),
         "methods": methods,
     }

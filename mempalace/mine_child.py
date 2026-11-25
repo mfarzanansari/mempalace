@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
 
 def lower_priority() -> str:
@@ -118,6 +119,14 @@ class _Channel:
 
         self.rx = rx
         self.tx = tx
+        # CPU this process has spent since the mine last made progress: a
+        # storage reply or an embedded slice (see ``mark_progress``). The
+        # heartbeat reports it, so the daemon can tell a mine that computes
+        # from one that spins while its heartbeat thread keeps beating.
+        self._compute_started = time.process_time()
+        # Work units done so far (embedded slices). Sent with each heartbeat.
+        self.work_units = 0
+        self._request_lock = threading.Lock()
         # The heartbeat thread writes too; frames must not interleave.
         self._tx_lock = threading.Lock()
 
@@ -126,8 +135,12 @@ class _Channel:
             _write_msg(self.tx, msg)
 
     def request(self, msg):
-        self._send(msg)
-        reply = _read_msg(self.rx)
+        # There is one reply stream. Concurrent callers must keep each
+        # request paired with its own reply. Heartbeats remain independent.
+        with self._request_lock:
+            self._send(msg)
+            reply = _read_msg(self.rx)
+            self._compute_started = time.process_time()
         if reply.get("ok"):
             return reply.get("value")
         exc = reply.get("exc")
@@ -138,6 +151,11 @@ class _Channel:
     def notify(self, msg) -> None:
         self._send(msg)
 
+    def mark_progress(self) -> None:
+        """Record one unit of mine work done between storage calls."""
+        self.work_units += 1
+        self._compute_started = time.process_time()
+
     def start_heartbeat(self, interval: float = HEARTBEAT_SECONDS):
         import threading
 
@@ -146,7 +164,13 @@ class _Channel:
         def beat() -> None:
             while not stop.wait(interval):
                 try:
-                    self.notify({"op": "progress"})
+                    self.notify(
+                        {
+                            "op": "progress",
+                            "compute_cpu": time.process_time() - self._compute_started,
+                            "units": self.work_units,
+                        }
+                    )
                 except (BrokenPipeError, OSError, ValueError):
                     return
 
@@ -155,6 +179,34 @@ class _Channel:
 
 
 _CHANNEL: _Channel | None = None
+
+# Documents embedded per slice in the child. A multiple of the ONNX
+# embedders' 32-document sub-batch, so slicing does not change how a batch is
+# padded, and small enough that a 1000-drawer upsert reports progress many
+# times instead of computing for minutes in one silent stretch.
+_EMBED_SLICE = 256
+
+
+def _sliced_embedder(embed):
+    """Wrap ``embedding_wrapper._embed_texts`` to embed in progress-marking slices."""
+
+    def embed_texts(texts, *, query=False, metadatas=None, embedder=None):
+        vectors = []
+        for start in range(0, len(texts), _EMBED_SLICE):
+            stop = start + _EMBED_SLICE
+            vectors.extend(
+                embed(
+                    texts[start:stop],
+                    query=query,
+                    metadatas=None if metadatas is None else metadatas[start:stop],
+                    embedder=embedder,
+                )
+            )
+            if _CHANNEL is not None:
+                _CHANNEL.mark_progress()
+        return vectors
+
+    return embed_texts
 
 
 # BaseCollection methods that simply run in the daemon. ``close`` is not here:
@@ -244,13 +296,16 @@ def _install_remote_storage() -> None:
     import importlib
 
     from . import (  # noqa: F401 - bind names first
+        cli,
         convo_miner,
         format_miner,
+        hallways,
         miner,
         palace as palace_mod,
+        revisions,
         service,
     )
-    from .backends import base as backends_base
+    from .backends import base as backends_base, embedding_wrapper
     from .backends.embedding_wrapper import EmbeddingCollection
 
     remote_cls, remote_iter_cls = _remote_collection_class()
@@ -282,8 +337,27 @@ def _install_remote_storage() -> None:
         # there, against the writes the daemon made for this job.
         return _CHANNEL.request({"op": "validate"})
 
+    def store_hallways(wing, file_keys, pair_counts, pair_rooms, min_count, *, config):
+        return _CHANNEL.request(
+            {"op": "store_hallways", "args": (wing, file_keys, pair_counts, pair_rooms, min_count)}
+        )
+
     replacements = {
         original_get_collection: get_collection,
+        cli._run_pass_zero: lambda project_dir, palace_dir, llm_provider: _CHANNEL.request(
+            {"op": "redetect_origin", "source": project_dir}
+        ),
+        hallways._store_wing_hallways: store_hallways,
+        revisions.append_drawer_revisions: lambda palace_path, revisions: _CHANNEL.request(
+            {"op": "revisions", "rows": list(revisions)}
+        ),
+        miner._compute_topic_tunnels_for_wing: lambda wing, config=None: _CHANNEL.request(
+            {"op": "topic_tunnels", "wing": wing}
+        ),
+        miner._compute_entity_tunnels_for_wing: lambda wing, config=None: _CHANNEL.request(
+            {"op": "entity_tunnels", "wing": wing}
+        ),
+        embedding_wrapper._embed_texts: _sliced_embedder(embedding_wrapper._embed_texts),
         original_validate: validate_after_mine,
         # Nothing is written to storage from this process, so the serial a
         # miner passes to the validation above never moves here.
@@ -311,7 +385,7 @@ def _install_remote_storage() -> None:
     # instead of quietly becoming a second writer.
     try:
         from .backends import get_backend_class
-        from .palace.backend import resolve_backend_name
+        from .palace import resolve_backend_name
 
         get_backend_class(resolve_backend_name(os.environ.get("MEMPALACE_PALACE_PATH", "")))
     except Exception:
