@@ -107,13 +107,26 @@ class ChildWriterViolation(RuntimeError):
     """A mine path tried to open the storage backend inside the mine child."""
 
 
+# How often the child tells the daemon it is alive. The daemon's reaper kills a
+# child silent for ``daemon.mine_stall_seconds`` (60 s by default).
+HEARTBEAT_SECONDS = 10.0
+
+
 class _Channel:
     def __init__(self, rx, tx):
+        import threading
+
         self.rx = rx
         self.tx = tx
+        # The heartbeat thread writes too; frames must not interleave.
+        self._tx_lock = threading.Lock()
+
+    def _send(self, msg) -> None:
+        with self._tx_lock:
+            _write_msg(self.tx, msg)
 
     def request(self, msg):
-        _write_msg(self.tx, msg)
+        self._send(msg)
         reply = _read_msg(self.rx)
         if reply.get("ok"):
             return reply.get("value")
@@ -123,7 +136,22 @@ class _Channel:
         raise RuntimeError(reply.get("message") or "daemon refused the call")
 
     def notify(self, msg) -> None:
-        _write_msg(self.tx, msg)
+        self._send(msg)
+
+    def start_heartbeat(self, interval: float = HEARTBEAT_SECONDS):
+        import threading
+
+        stop = threading.Event()
+
+        def beat() -> None:
+            while not stop.wait(interval):
+                try:
+                    self.notify({"op": "progress"})
+                except (BrokenPipeError, OSError, ValueError):
+                    return
+
+        threading.Thread(target=beat, name="mine-child-heartbeat", daemon=True).start()
+        return stop
 
 
 _CHANNEL: _Channel | None = None
@@ -321,6 +349,7 @@ def main() -> int:
     payload = dict(job.get("payload") or {})
     palace_path = payload.get("palace_path") or os.environ.get("MEMPALACE_PALACE_PATH", "")
     _CHANNEL.notify({"op": "started", "pid": os.getpid(), "priority": applied})
+    heartbeat = _CHANNEL.start_heartbeat()
     try:
         _adopt_palace_lock(palace_path)
         _install_remote_storage()
@@ -334,6 +363,7 @@ def main() -> int:
             "error_class": type(exc).__name__,
             "exit_code": 1,
         }
+    heartbeat.set()
     result = dict(result or {})
     result["priority"] = applied
     try:
