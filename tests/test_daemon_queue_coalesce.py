@@ -218,20 +218,27 @@ def test_debounce_is_configurable_by_file_and_env(tmp_path, monkeypatch):
     assert cfg.daemon_debounce("stop") == (5.0, 900.0)
 
 
-def test_stop_hook_mine_is_submitted_with_the_stop_debounce(monkeypatch):
-    from unittest.mock import patch
+def test_stop_hook_mine_is_queued_with_the_stop_debounce(tmp_path, monkeypatch):
+    from mempalace import daemon_queue, hooks_cli
 
-    from mempalace import hooks_cli
-
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(palace))
+    monkeypatch.setenv(daemon_queue.STATE_ROOT_ENV, str(tmp_path / "state"))
     monkeypatch.delenv("MEMPALACE_DAEMON_STOP_SETTLE_SECONDS", raising=False)
-    with patch("mempalace.daemon.submit_job", return_value={"id": "j"}) as submit:
-        with hooks_cli._hook_trigger("stop"):
-            hooks_cli._submit_daemon_job("mine", {"source": "/x"}, dedupe_key="k")
-        with hooks_cli._hook_trigger("precompact"):
-            hooks_cli._submit_daemon_job("mine", {"source": "/x"}, dedupe_key="k")
-        with hooks_cli._hook_trigger("stop"):
-            hooks_cli._submit_daemon_job("diary_write", {"entry": "e"})
-    stop, precompact, diary = submit.call_args_list
-    assert (stop.kwargs["settle_seconds"], stop.kwargs["max_wait_seconds"]) == (120.0, 900.0)
-    assert precompact.kwargs["settle_seconds"] == 0.0
-    assert diary.kwargs["settle_seconds"] == 0.0, "diary writes are never debounced"
+    monkeypatch.setattr(hooks_cli, "_ensure_daemon_started", lambda _p: None)
+
+    with hooks_cli._hook_trigger("stop"):
+        stop = hooks_cli._submit_daemon_job("mine", {"source": "/x"}, dedupe_key="stop-k")
+        diary = hooks_cli._submit_daemon_job("diary_write", {"entry": "e"})
+    with hooks_cli._hook_trigger("precompact"):
+        pre = hooks_cli._submit_daemon_job("mine", {"source": "/y"}, dedupe_key="pre-k")
+
+    store = daemon_queue.QueueStore(daemon_queue.queue_path(str(palace)))
+    stop_job, diary_job, pre_job = (store.get(j["id"]) for j in (stop, diary, pre))
+    created = stop_job.deadline - 900
+    assert stop_job.run_after == pytest.approx(created + 120)
+    assert pre_job.run_after == pytest.approx(pre_job.deadline)
+    assert diary_job.run_after == pytest.approx(diary_job.deadline), "diary is never debounced"
+    # The daemon, never the client, decides which palace a job writes to.
+    assert stop_job.payload["palace_path"] == daemon_queue.canonical_palace_path(str(palace))
