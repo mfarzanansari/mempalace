@@ -54,6 +54,7 @@ from .daemon_queue import (  # noqa: F401 - re-exported for existing callers
     _registered_pid,
     _write_private,
     canonical_palace_path,
+    clear_start_refused,
     daemon_registered_alive,
     daemon_singleton,
     endpoint_path,
@@ -62,6 +63,7 @@ from .daemon_queue import (  # noqa: F401 - re-exported for existing callers
     palace_key,
     pid_path,
     queue_path,
+    record_start_refused,
     spawn_daemon_detached,
     state_dir,
     state_root,
@@ -163,6 +165,12 @@ class DaemonRuntime:
         self.active_child = None
         # Command for the mine child; None runs ``mempalace.mine_child``.
         self.mine_child_argv: list[str] | None = None
+        # Whether this process holds the palace write lock for its lifetime
+        # (single-writer backends). A mine child counts it as held only then;
+        # otherwise the child takes the lock itself, as any other miner would.
+        self.holds_palace_lock = True
+        # Set when the idle watch stopped the server (see run_server).
+        self.idle_exited = False
         self.worker_threads: dict[str, threading.Thread] = {}
         # job_id -> monotonic deadline before which a lock-refused job is not
         # re-claimed. Each lane only touches its own jobs' entries.
@@ -284,6 +292,7 @@ class DaemonRuntime:
                     on_start=_attach,
                     argv=self.mine_child_argv,
                     stall_seconds=config.daemon_mine_stall_seconds,
+                    lock_held=self.holds_palace_lock,
                 )
             finally:
                 self.active_child = None
@@ -522,6 +531,7 @@ def _start_idle_exit_watch(runtime: "DaemonRuntime", httpd, idle_minutes: float)
         while not runtime.shutdown_event.wait(tick):
             if runtime.idle_seconds() >= limit:
                 _LIFECYCLE_LOGGER.info("idle for %g min with an empty queue; exiting", idle_minutes)
+                runtime.idle_exited = True
                 runtime.shutdown_event.set()
                 httpd.shutdown()
                 return
@@ -571,12 +581,18 @@ def run_server(  # noqa: C901
             try:
                 writer_lease.enter_context(mine_palace_lock(palace_path))
             except MineAlreadyRunning as exc:
-                raise DaemonError(
+                message = (
                     "writable daemon startup refused: another writer owns "
                     f"local backend {resolved_backend!r} for {palace_path!r}; "
                     "stop the existing writable MCP/direct/daemon owner, or "
                     "route all writes through that owner"
-                ) from exc
+                )
+                # Hooks read this and stop starting daemons that would only
+                # refuse again; ``prefer`` then takes its direct path.
+                record_start_refused(palace_path, message)
+                raise DaemonError(message) from exc
+        holds_palace_lock = backend_requires_single_writer(resolved_backend)
+        clear_start_refused(palace_path)
 
         token = ensure_token(palace_path)
         # Backend resolution above is only the ownership decision. Preserve
@@ -584,6 +600,7 @@ def run_server(  # noqa: C901
         # DaemonRuntime historically injects a backend only when one was
         # explicitly selected.
         runtime = DaemonRuntime(palace_path, backend=backend)
+        runtime.holds_palace_lock = holds_palace_lock
     except BaseException:
         writer_lease.close()
         _restore_server_process_state(previous_env, prev_umask)
@@ -763,6 +780,28 @@ def run_server(  # noqa: C901
     finally:
         _close_or_defer_writer_lease(writer_lease, runtime)
         _restore_server_process_state(previous_env, prev_umask)
+        if runtime is not None and runtime.idle_exited:
+            _hand_off_late_work(runtime, palace_path, backend)
+
+
+def _hand_off_late_work(runtime: "DaemonRuntime", palace_path: str, backend: str | None) -> None:
+    """Start a successor if a job was queued while this idle daemon exited.
+
+    A hook that enqueued after the idle check but before the registration was
+    removed saw this daemon alive and started none. By now the registration
+    and the lifetime lock are gone, so a hook enqueuing from here on starts
+    its own; this check covers the jobs that arrived before.
+    """
+    try:
+        queued = runtime.store.counts().get("queued", 0)
+    except Exception:  # noqa: BLE001 - best-effort; the next hook starts one anyway
+        return
+    if queued:
+        _LIFECYCLE_LOGGER.info("%d job(s) arrived while exiting; starting a successor", queued)
+        try:
+            spawn_daemon_detached(palace_path, backend=backend, ignore_throttle=True)
+        except Exception:  # noqa: BLE001 - the jobs stay queued for the next hook
+            pass
 
 
 def _drain_and_cleanup(
@@ -777,6 +816,21 @@ def _drain_and_cleanup(
     content). Finally restore the env vars run_server mutated.
     """
     runtime.shutdown_event.set()
+    child = runtime.active_child
+    if child is not None:
+        # A mine child only computes; every write it asked for already ran
+        # here, whole. Stopping it first loses no stored data -- the next mine
+        # resumes where it stopped -- and frees the main lane at once instead
+        # of serving the child's writes through the whole drain window.
+        main_job = runtime.active_jobs.get("main")
+        if main_job:
+            runtime._safe_finish(
+                main_job,
+                state="cancelled",
+                result={"success": False, "exit_code": 1},
+                error={"message": "cancelled by daemon shutdown"},
+            )
+        child.kill("daemon shutdown")
     deadline = time.monotonic() + SHUTDOWN_DRAIN_SECONDS
     for worker in list(runtime.worker_threads.values()):
         worker.join(timeout=max(0.0, deadline - time.monotonic()))
@@ -787,12 +841,6 @@ def _drain_and_cleanup(
             result={"success": False, "exit_code": 1},
             error={"message": "cancelled by daemon shutdown"},
         )
-    child = runtime.active_child
-    if child is not None:
-        # A mine child only computes; every write it asked for already ran
-        # here, whole. Stopping it loses no stored data, and the next mine
-        # resumes where it stopped.
-        child.kill("daemon shutdown")
     for stale in (endpoint_path(palace_path), pid_path(palace_path)):
         try:
             stale.unlink()

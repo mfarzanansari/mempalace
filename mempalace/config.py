@@ -1781,15 +1781,19 @@ class MempalaceConfig:
         The child sends a heartbeat every 10 s and a message per storage call;
         time the daemon spends running a call does not count. Env
         ``MEMPALACE_DAEMON_MINE_STALL_SECONDS`` > config
-        ``daemon.mine_stall_seconds`` > 60. ``0`` disables the reaper.
+        ``daemon.mine_stall_seconds`` > 60, never under 20 (two heartbeats).
+        ``0`` disables the reaper.
         """
         raw = os.environ.get("MEMPALACE_DAEMON_MINE_STALL_SECONDS")
         if raw is None:
             raw = self._daemon_section().get("mine_stall_seconds", 60)
         try:
-            return max(0.0, float(str(raw).strip()))
+            value = max(0.0, float(str(raw).strip()))
         except (TypeError, ValueError):
             return 60.0
+        # Below two heartbeats (mine_child.HEARTBEAT_SECONDS = 10) a healthy
+        # child computing between storage calls would be killed.
+        return value if value == 0 else max(value, 20.0)
 
     @property
     def daemon_idle_exit_minutes(self) -> "float | None":

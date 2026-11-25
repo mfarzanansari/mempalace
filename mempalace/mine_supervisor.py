@@ -60,6 +60,17 @@ def _popen_kwargs() -> dict:
     return kwargs
 
 
+def _send_reply(stream, reply: dict) -> None:
+    """Send ``reply``, or an error in its place when it cannot be pickled."""
+    try:
+        data = pickle.dumps(reply, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception as exc:  # noqa: BLE001 - any pickling failure becomes the child's error
+        error = RuntimeError(f"daemon could not send the result: {type(exc).__name__}: {exc}")
+        data = pickle.dumps({"ok": False, "exc": error}, protocol=pickle.HIGHEST_PROTOCOL)
+    stream.write(len(data).to_bytes(4, "big") + data)
+    stream.flush()
+
+
 def _picklable_exc(exc: BaseException) -> BaseException:
     try:
         pickle.loads(pickle.dumps(exc))
@@ -139,6 +150,7 @@ def run_mine_in_child(
     argv: Optional[list] = None,
     stall_seconds: float = DEFAULT_STALL_SECONDS,
     exit_grace_seconds: float = DEFAULT_EXIT_GRACE_SECONDS,
+    lock_held: bool = True,
 ) -> dict:
     """Run one mine job in a child process; return the job result.
 
@@ -149,7 +161,10 @@ def run_mine_in_child(
     fails and the daemon carries on; writes already made stay, and the next
     mine picks up where this one stopped.
 
-    ``argv`` overrides the child command (tests use a fake child).
+    ``lock_held`` says whether this process holds the palace write lock for
+    the job, so the child may treat it as held; otherwise the child's mine
+    takes the lock itself. ``argv`` overrides the child command (tests use a
+    fake child).
     """
     from .palace import _validate_palace_fts5_after_mine, get_collection, palace_write_serial
 
@@ -171,7 +186,10 @@ def run_mine_in_child(
     writes_at_start = palace_write_serial()
     result: Optional[dict] = None
     try:
-        _write_msg(proc.stdin, {"payload": payload})
+        try:
+            _write_msg(proc.stdin, {"payload": payload, "lock_held": lock_held})
+        except (BrokenPipeError, OSError):
+            pass  # died before reading its job; reported below from the exit code
         while True:
             try:
                 msg = _read_msg(proc.stdout)
@@ -209,7 +227,7 @@ def run_mine_in_child(
                 child.last_progress = time.monotonic()
                 child.serving = False
             try:
-                _write_msg(proc.stdin, reply)
+                _send_reply(proc.stdin, reply)
             except (BrokenPipeError, OSError):
                 break
     finally:
