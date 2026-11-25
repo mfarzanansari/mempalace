@@ -671,6 +671,29 @@ def _compute_hook_write_routing() -> HookWriteRouting:
     return routing
 
 
+# Which hook fired ("stop", "precompact", "session_end"). It picks the debounce
+# a daemon mine is queued with: Stop is coalesced over a settle window,
+# PreCompact and SessionEnd run at once (see MempalaceConfig.daemon_debounce).
+_HOOK_TRIGGER = ContextVar("mempalace_hook_trigger", default="")
+
+
+@contextmanager
+def _hook_trigger(name: str):
+    token = _HOOK_TRIGGER.set(str(name or "").replace("-", "_"))
+    try:
+        yield
+    finally:
+        _HOOK_TRIGGER.reset(token)
+
+
+def _mine_debounce() -> tuple:
+    """``(settle_seconds, max_wait_seconds)`` for a mine queued by this hook."""
+    try:
+        return MempalaceConfig().daemon_debounce(_HOOK_TRIGGER.get())
+    except Exception:
+        return 0.0, 0.0
+
+
 def _current_hook_write_routing() -> HookWriteRouting:
     routing = _HOOK_WRITE_ROUTING_CONTEXT.get()
     if routing is not None:
@@ -718,12 +741,15 @@ def _submit_daemon_job(
     from .daemon import submit_job
 
     palace_path = MempalaceConfig().palace_path
+    settle, max_wait = _mine_debounce() if kind == "mine" else (0.0, 0.0)
     return submit_job(
         kind,
         payload,
         palace_path=palace_path,
         dedupe_key=dedupe_key,
         priority=priority,
+        settle_seconds=settle,
+        max_wait_seconds=max_wait,
         wait=wait,
         auto_start=False,
         timeout=timeout,
@@ -1918,4 +1944,5 @@ def run_hook(hook_name: str, harness: str):
         print(f"Unknown hook: {hook_name}", file=sys.stderr)
         sys.exit(1)
 
-    handler(data, harness)
+    with _hook_trigger(hook_name):
+        handler(data, harness)

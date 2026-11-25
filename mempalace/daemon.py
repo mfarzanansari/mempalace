@@ -205,13 +205,30 @@ class Job:
     result: dict[str, Any] | None
     error: dict[str, Any] | None
     attempts: int
+    # Epoch seconds (``QueueStore.clock``) before which the job is not claimed,
+    # and the latest time coalescing may push ``run_after`` to. None on rows
+    # written before the debounce columns existed: they run at once.
+    run_after: float | None = None
+    deadline: float | None = None
+
+
+# Queue schema version, kept in ``PRAGMA user_version``.
+#   0/1: ``idx_jobs_dedupe_active`` unique over state IN ('queued','running')
+#   2:   ``idx_jobs_dedupe_queued`` unique over state = 'queued' only, plus the
+#        ``run_after`` / ``deadline`` debounce columns.
+QUEUE_SCHEMA_VERSION = 2
+SUPERSEDED_ERROR_CLASS = "Superseded"
 
 
 class QueueStore:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, clock=time.time):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        # Wall-clock epoch seconds. ``run_after`` is compared across processes
+        # (the hook enqueues, the daemon claims), so a monotonic clock is out.
+        # Injected by tests to drive the debounce deterministically.
+        self.clock = clock
         self._init_db()
 
     @contextlib.contextmanager
@@ -258,13 +275,7 @@ class QueueStore:
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state, priority)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_dedupe ON jobs(dedupe_key, state)")
-            # Unique partial index: at most one queued/running job per dedupe_key.
-            # Enforces the dedupe invariant across processes (TOCTOU-safe); finished
-            # jobs drop out of the index so a later identical enqueue is allowed.
-            conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_dedupe_active "
-                "ON jobs(dedupe_key) WHERE state IN ('queued', 'running')"
-            )
+            self._migrate(conn)
         # The queue DB holds verbatim payloads (diary text, source paths) — lock it
         # down to owner-only regardless of the invoking user's umask. The WAL/SHM
         # sidecars carry the same un-checkpointed payloads, so harden them too when
@@ -275,6 +286,35 @@ class QueueStore:
             sidecar = self.path.with_name(self.path.name + sidecar_suffix)
             if sidecar.exists():
                 _chmod_private(sidecar)
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Bring an existing queue DB up to ``QUEUE_SCHEMA_VERSION`` in place.
+
+        Additive only: columns are added, never dropped, and no row is
+        rewritten, so a queue written by an older daemon keeps every job.
+
+        The dedupe index narrows from ``state IN ('queued','running')`` to
+        ``state = 'queued'``. That is what lets one running job and one pending
+        rerun of the same source coexist: an event that lands while its source
+        is being mined must queue a rerun, not vanish into the running job.
+        Every existing row already satisfies the narrower constraint (it is
+        implied by the old one), so building the new index cannot fail. The
+        new index is built before the old one is dropped, so no instant exists
+        without a uniqueness guard.
+        """
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+        for name in ("run_after", "deadline"):
+            if name not in columns:
+                conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} REAL")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_dedupe_queued "
+            "ON jobs(dedupe_key) WHERE state = 'queued'"
+        )
+        conn.execute("DROP INDEX IF EXISTS idx_jobs_dedupe_active")
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if version < QUEUE_SCHEMA_VERSION:
+            conn.execute(f"PRAGMA user_version = {QUEUE_SCHEMA_VERSION}")
 
     def prune_terminal(self, older_than_days: int = JOB_RETENTION_DAYS) -> int:
         """Delete terminal (succeeded/failed/cancelled) jobs older than the
@@ -327,15 +367,70 @@ class QueueStore:
                     MAX_ATTEMPTS,
                 ),
             )
-            cur = conn.execute(
-                """
-                UPDATE jobs
-                SET state = 'queued', started_at = NULL
-                WHERE state = 'running' AND attempts < ?
-                """,
+            rows = conn.execute(
+                "SELECT id FROM jobs WHERE state = 'running' AND attempts < ?",
                 (MAX_ATTEMPTS,),
+            ).fetchall()
+            requeued = 0
+            for row in rows:
+                if self._requeue_or_supersede(conn, row["id"]):
+                    requeued += 1
+            return requeued
+
+    def _requeue_or_supersede(
+        self,
+        conn: sqlite3.Connection,
+        job_id: str,
+        *,
+        extra_where: str = "",
+        extra_params: tuple = (),
+        error_json: str | None = None,
+        set_error: bool = False,
+        refund_attempt: bool = False,
+    ) -> bool:
+        """Move a running job back to ``queued``, unless a rerun already waits.
+
+        A running job and one pending rerun of the same dedupe key may coexist,
+        so re-queuing the running row can collide with the queued one on
+        ``idx_jobs_dedupe_queued``. The queued row was enqueued later and holds
+        the newer payload, so it supersedes the running row: that row is
+        closed as ``cancelled`` with ``Superseded``, and the source is still
+        processed once, by the rerun. Returns True when the row was re-queued.
+        """
+        attempts_sql = "MAX(attempts - 1, 0)" if refund_attempt else "attempts"
+        try:
+            cur = conn.execute(
+                f"""
+                UPDATE jobs
+                SET state = 'queued', started_at = NULL,
+                    attempts = {attempts_sql},
+                    error_json = CASE WHEN ? THEN ? ELSE error_json END
+                WHERE id = ? AND state = 'running' {extra_where}
+                """,
+                (int(set_error), error_json, job_id, *extra_params),
             )
-            return int(cur.rowcount or 0)
+            return cur.rowcount == 1
+        except sqlite3.IntegrityError:
+            conn.execute(
+                f"""
+                UPDATE jobs
+                SET state = 'cancelled', finished_at = ?, error_json = ?
+                WHERE id = ? AND state = 'running' {extra_where}
+                """,
+                (
+                    _now(),
+                    json.dumps(
+                        {
+                            "error_class": SUPERSEDED_ERROR_CLASS,
+                            "message": "superseded by a newer queued job for the same source",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    job_id,
+                    *extra_params,
+                ),
+            )
+            return False
 
     def enqueue(
         self,
@@ -344,63 +439,133 @@ class QueueStore:
         *,
         dedupe_key: str | None = None,
         priority: int = 0,
+        settle_seconds: float = 0.0,
+        max_wait_seconds: float | None = None,
     ) -> Job:
+        """Queue a job, coalescing with a queued job of the same ``dedupe_key``.
+
+        Coalescing is latest-wins: the queued row keeps its id and its place
+        in line (``created_at``) but takes this call's payload, so the run that
+        eventually happens sees the newest content. A job of the same key that
+        is already *running* is left alone; this call queues the one pending
+        rerun beside it instead of being swallowed by it.
+
+        Debounce (the Syncthing ``fsWatcherDelayS``/``fsWatcherTimeoutS`` shape):
+
+            deadline  = MIN(deadline, now + max_wait)
+            run_after = MIN(deadline, now + settle)
+
+        Each event pushes ``run_after`` out by ``settle`` so a burst collapses
+        into one run, but never past ``deadline``, which only ever moves
+        earlier -- a steady stream of events still runs within ``max_wait`` of
+        the first, and an immediate trigger (``max_wait`` 0) is never delayed
+        by a later debounced one. ``max_wait`` defaults to ``settle``.
+
+        UPDATE-first, then INSERT: the UPDATE takes SQLite's write lock, so the
+        sequence is atomic against another process enqueuing the same key, and
+        it avoids ``INSERT ... ON CONFLICT`` on a partial index, which the
+        SQLite bundled with older Pythons does not support.
+        """
         payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        settle = max(0.0, float(settle_seconds or 0.0))
+        max_wait = settle if max_wait_seconds is None else max(0.0, float(max_wait_seconds))
         with self._lock, self._connect() as conn:
+            now = float(self.clock())
             if dedupe_key:
-                row = conn.execute(
-                    """
-                    SELECT * FROM jobs
-                    WHERE dedupe_key = ? AND state IN ('queued', 'running')
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                    """,
-                    (dedupe_key,),
-                ).fetchone()
+                row = self._coalesce(
+                    conn, dedupe_key, kind, payload_json, priority, now, settle, max_wait
+                )
                 if row is not None:
                     return self._row_to_job(row)
-
             job_id = uuid.uuid4().hex
+            deadline = now + max_wait
+            run_after = min(deadline, now + settle)
             try:
                 conn.execute(
                     """
                     INSERT INTO jobs (
-                        id, kind, payload_json, state, priority, dedupe_key, created_at, attempts
-                    ) VALUES (?, ?, ?, 'queued', ?, ?, ?, 0)
+                        id, kind, payload_json, state, priority, dedupe_key, created_at,
+                        attempts, run_after, deadline
+                    ) VALUES (?, ?, ?, 'queued', ?, ?, ?, 0, ?, ?)
                     """,
-                    (job_id, kind, payload_json, int(priority), dedupe_key, _now()),
+                    (
+                        job_id,
+                        kind,
+                        payload_json,
+                        int(priority),
+                        dedupe_key,
+                        _now(),
+                        run_after,
+                        deadline,
+                    ),
                 )
             except sqlite3.IntegrityError:
-                # Unique partial index beat us in a cross-process race — return the
-                # job that won. SELECT-then-INSERT is not atomic across processes; the
-                # index is the source of truth.
+                # A queued row for this key appeared between our UPDATE and
+                # INSERT (an older client that SELECTs first, or no write lock
+                # held yet). The index is the source of truth: coalesce into it.
                 if not dedupe_key:
                     raise
-                row = conn.execute(
-                    """
-                    SELECT * FROM jobs
-                    WHERE dedupe_key = ? AND state IN ('queued', 'running')
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                    """,
-                    (dedupe_key,),
-                ).fetchone()
+                row = self._coalesce(
+                    conn, dedupe_key, kind, payload_json, priority, now, settle, max_wait
+                )
                 if row is None:
-                    # Index guard fired but the row is already gone — retry the INSERT.
-                    conn.execute(
-                        """
-                        INSERT INTO jobs (
-                            id, kind, payload_json, state, priority, dedupe_key, created_at, attempts
-                        ) VALUES (?, ?, ?, 'queued', ?, ?, ?, 0)
-                        """,
-                        (job_id, kind, payload_json, int(priority), dedupe_key, _now()),
-                    )
-                    row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+                    raise
                 return self._row_to_job(row)
             row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
             return self._row_to_job(row)
 
-    def claim_next(self, *, exclude: set[str] | None = None) -> Job | None:
+    @staticmethod
+    def _coalesce(
+        conn: sqlite3.Connection,
+        dedupe_key: str,
+        kind: str,
+        payload_json: str,
+        priority: int,
+        now: float,
+        settle: float,
+        max_wait: float,
+    ):
+        """Fold one enqueue into the queued row for ``dedupe_key``; None if absent."""
+        cur = conn.execute(
+            """
+            UPDATE jobs
+            SET kind = ?, payload_json = ?, priority = MAX(priority, ?),
+                deadline = MIN(COALESCE(deadline, ?), ?),
+                run_after = MIN(MIN(COALESCE(deadline, ?), ?), ?)
+            WHERE dedupe_key = ? AND state = 'queued'
+            """,
+            (
+                kind,
+                payload_json,
+                int(priority),
+                now + max_wait,
+                now + max_wait,
+                now + max_wait,
+                now + max_wait,
+                now + settle,
+                dedupe_key,
+            ),
+        )
+        if cur.rowcount != 1:
+            return None
+        return conn.execute(
+            "SELECT * FROM jobs WHERE dedupe_key = ? AND state = 'queued'", (dedupe_key,)
+        ).fetchone()
+
+    def next_run_after(self) -> float | None:
+        """Earliest ``run_after`` among queued jobs, for the worker's sleep."""
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT MIN(COALESCE(run_after, 0)) AS t FROM jobs WHERE state = 'queued'"
+            ).fetchone()
+            return None if row is None or row["t"] is None else float(row["t"])
+
+    def claim_next(
+        self,
+        *,
+        exclude: set[str] | None = None,
+        kinds: tuple[str, ...] | None = None,
+    ) -> Job | None:
         # Atomic across processes: the UPDATE only fires if the row is still
         # 'queued'. If two daemon processes SELECT the same row, the first to
         # UPDATE it flips state to 'running' (rowcount=1); the second's UPDATE
@@ -431,19 +596,39 @@ class QueueStore:
         # one would outlive its cause -- reporting a lock refusal for a job that
         # later crashed, and leaking into recover_running's dead-letter (which
         # COALESCEs it) in place of ``MaxAttemptsExceeded``.
+        #
+        # A job is claimable once its debounce window (``run_after``) has
+        # passed, and only while no job of the same dedupe key is running: the
+        # pending rerun waits for the run it follows, so one source is never
+        # processed twice at once. ``kinds`` restricts a lane (the diary lane
+        # claims only ``diary_write``).
         exclude = exclude or set()
+        kind_sql = ""
+        kind_params: tuple = ()
+        if kinds:
+            kind_sql = f"AND kind IN ({', '.join('?' for _ in kinds)})"
+            kind_params = tuple(kinds)
         with self._lock, self._connect() as conn:
+            now = float(self.clock())
             # Only the ids: the rows being skipped are here to be discarded, and
             # jobs carry verbatim payloads, so selecting * would materialise a
             # cooling job's user content just to read its id past it.
             candidates = conn.execute(
-                """
-                SELECT id FROM jobs
+                f"""
+                SELECT id FROM jobs AS q
                 WHERE state = 'queued'
+                  AND COALESCE(run_after, 0) <= ?
+                  {kind_sql}
+                  AND (
+                    dedupe_key IS NULL OR NOT EXISTS (
+                      SELECT 1 FROM jobs AS r
+                      WHERE r.dedupe_key = q.dedupe_key AND r.state = 'running'
+                    )
+                  )
                 ORDER BY priority DESC, created_at ASC
                 LIMIT ?
                 """,
-                (len(exclude) + 1,),
+                (now, *kind_params, len(exclude) + 1),
             ).fetchall()
             job_id = next((r["id"] for r in candidates if r["id"] not in exclude), None)
             if job_id is None:
@@ -528,21 +713,14 @@ class QueueStore:
         own. ``None`` skips the check.
         """
         with self._lock, self._connect() as conn:
-            conn.execute(
-                """
-                UPDATE jobs
-                SET state = 'queued', started_at = NULL,
-                    attempts = MAX(attempts - 1, 0),
-                    error_json = ?
-                WHERE id = ? AND state = 'running'
-                  AND (? IS NULL OR started_at = ?)
-                """,
-                (
-                    json.dumps(error or {}, ensure_ascii=False) if error else None,
-                    job_id,
-                    claimed_started_at,
-                    claimed_started_at,
-                ),
+            self._requeue_or_supersede(
+                conn,
+                job_id,
+                extra_where="AND (? IS NULL OR started_at = ?)",
+                extra_params=(claimed_started_at, claimed_started_at),
+                error_json=json.dumps(error or {}, ensure_ascii=False) if error else None,
+                set_error=True,
+                refund_attempt=True,
             )
             row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
             return self._row_to_job(row)
@@ -590,6 +768,8 @@ class QueueStore:
             result=_loads(row["result_json"]),
             error=_loads(row["error_json"]),
             attempts=int(row["attempts"]),
+            run_after=row["run_after"],
+            deadline=row["deadline"],
         )
 
 
@@ -624,6 +804,7 @@ def job_to_dict(job: Job, *, include_payload: bool = True) -> dict[str, Any]:
         "result": job.result,
         "error": job.error,
         "attempts": job.attempts,
+        "run_after": job.run_after,
     }
     if include_payload:
         out["payload"] = job.payload
@@ -1042,6 +1223,12 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
                         body.get("payload") or {},
                         dedupe_key=body.get("dedupe_key"),
                         priority=int(body.get("priority") or 0),
+                        settle_seconds=float(body.get("settle_seconds") or 0.0),
+                        max_wait_seconds=(
+                            None
+                            if body.get("max_wait_seconds") is None
+                            else float(body["max_wait_seconds"])
+                        ),
                     )
                     runtime.worker_wake.set()
                 except Exception as exc:  # noqa: BLE001 - client gets structured failure
@@ -1225,12 +1412,21 @@ class DaemonClient:
         *,
         dedupe_key: str | None = None,
         priority: int = 0,
+        settle_seconds: float = 0.0,
+        max_wait_seconds: float | None = None,
     ) -> dict[str, Any]:
-        return self.request(
-            "POST",
-            "/jobs",
-            {"kind": kind, "payload": payload, "dedupe_key": dedupe_key, "priority": priority},
-        )["job"]
+        body: dict[str, Any] = {
+            "kind": kind,
+            "payload": payload,
+            "dedupe_key": dedupe_key,
+            "priority": priority,
+        }
+        # Only sent when set, so an older daemon sees the request it always did.
+        if settle_seconds:
+            body["settle_seconds"] = settle_seconds
+        if max_wait_seconds is not None:
+            body["max_wait_seconds"] = max_wait_seconds
+        return self.request("POST", "/jobs", body)["job"]
 
     def get_job(self, job_id: str) -> dict[str, Any]:
         return self.request("GET", f"/jobs/{job_id}")["job"]
@@ -1663,6 +1859,8 @@ def submit_job(
     backend: str | None = None,
     dedupe_key: str | None = None,
     priority: int = 0,
+    settle_seconds: float = 0.0,
+    max_wait_seconds: float | None = None,
     wait: bool = True,
     auto_start: bool = False,
     timeout: float = DEFAULT_WAIT_TIMEOUT,
@@ -1677,7 +1875,14 @@ def submit_job(
     if backend:
         payload["backend"] = backend
     client = ensure_client(resolved_palace, backend=backend, auto_start=auto_start)
-    job = client.submit(kind, payload, dedupe_key=dedupe_key, priority=priority)
+    job = client.submit(
+        kind,
+        payload,
+        dedupe_key=dedupe_key,
+        priority=priority,
+        settle_seconds=settle_seconds,
+        max_wait_seconds=max_wait_seconds,
+    )
     if not wait:
         return job
     return client.wait(job["id"], timeout=timeout, stop_on_lock_deferral=stop_on_lock_deferral)
