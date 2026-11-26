@@ -122,3 +122,88 @@ def test_contended_queue_returns_within_hook_budget(state, monkeypatch):
         with pytest.raises(sqlite3.OperationalError, match="locked"):
             hooks_cli._submit_daemon_job("mine", {"source": "s"})
         assert time.monotonic() - t0 < 0.5
+
+
+def test_zz_diag_hook_enqueue_timings(state, monkeypatch):
+    # DIAGNOSTIC ONLY: times each step of _submit_daemon_job under contention.
+    import sqlite3
+
+    from mempalace.config import MempalaceConfig
+
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", state)
+    path = daemon_queue.queue_path(state)
+    store = daemon_queue.QueueStore(path)
+    out = []
+    for rnd in range(3):
+        with store._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            t = time.monotonic()
+            pp = MempalaceConfig().palace_path
+            t1 = time.monotonic()
+            cp = daemon_queue.canonical_palace_path(pp)
+            t2 = time.monotonic()
+            qs = daemon_queue.QueueStore(daemon_queue.queue_path(cp), timeout=0.15)
+            t3 = time.monotonic()
+            with qs._connect() as c2:
+                c2.execute("SELECT 1").fetchone()
+            t4 = time.monotonic()
+            try:
+                qs.enqueue("mine", {"source": "s"})
+            except sqlite3.OperationalError:
+                pass
+            t5 = time.monotonic()
+            raw = sqlite3.connect(str(path), timeout=0.15)
+            t6 = time.monotonic()
+            try:
+                raw.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError:
+                pass
+            t7 = time.monotonic()
+            raw.close()
+            raw0 = sqlite3.connect(str(path), timeout=0)
+            t8 = time.monotonic()
+            try:
+                raw0.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError:
+                pass
+            t9 = time.monotonic()
+            raw0.close()
+            tr0 = time.monotonic()
+            deadline = tr0 + 0.15
+            tries = 0
+            pause = 0.001
+            while True:
+                tries += 1
+                rc = sqlite3.connect(str(path), timeout=0)
+                try:
+                    rc.execute("BEGIN IMMEDIATE")
+                    break
+                except sqlite3.OperationalError:
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(min(pause, deadline - time.monotonic()))
+                    pause = min(pause * 2, 0.02)
+                finally:
+                    rc.close()
+            tr1 = time.monotonic()
+            sl = []
+            for ms in (1, 2, 5, 10):
+                s0 = time.monotonic()
+                time.sleep(ms / 1000)
+                sl.append(f"{ms}ms->{(time.monotonic() - s0) * 1000:.1f}")
+            ta = time.monotonic()
+            try:
+                hooks_cli._submit_daemon_job("mine", {"source": "s"})
+            except sqlite3.OperationalError:
+                pass
+            tb = time.monotonic()
+            out.append(
+                f"round{rnd}: total_submit={1000 * (tb - ta):.1f} "
+                f"config={1000 * (t1 - t):.1f} canon={1000 * (t2 - t1):.1f} "
+                f"init={1000 * (t3 - t2):.1f} connect+select={1000 * (t4 - t3):.1f} "
+                f"enqueue_busy={1000 * (t5 - t4):.1f} raw_connect={1000 * (t6 - t5):.1f} "
+                f"raw_busy0.15={1000 * (t7 - t6):.1f} raw_connect0={1000 * (t8 - t7):.1f} "
+                f"raw_busy0={1000 * (t9 - t8):.1f} py_retry0.15={1000 * (tr1 - tr0):.1f}/{tries} sleeps=[{' '.join(sl)}]"
+            )
+    out.append(f"sqlite={sqlite3.sqlite_version} platform={sys.platform}")
+    raise AssertionError("DIAG " + " || ".join(out))
