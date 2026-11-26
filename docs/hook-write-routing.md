@@ -114,8 +114,10 @@ On Linux a `SCHED_IDLE` child that is silent because busier processes take
 every CPU (runnable, its CPU time flat) is not killed. Elsewhere the daemon
 cannot tell a starved child from a wedged one, so a background-priority child
 it cannot sample (macOS, Windows, Linux `nice 19`) gets ten times the stall
-limit, 10 minutes by default, before it is killed. `/health` reports the running child under
-`mine_progress` (pid, calls served, seconds since its last message).
+limit, 10 minutes by default, before it is killed.
+
+`/health` reports the running child under `mine_progress` (pid, calls
+served, seconds since its last message).
 
     MEMPALACE_DAEMON_MINE_STALL_SECONDS=60  # or daemon.mine_stall_seconds; 0 = no reaper
 

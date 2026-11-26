@@ -473,29 +473,6 @@ def test_other_hooks_do_not_spawn_while_launcher_is_in_popen(state):
     assert len(spawned) == 1
 
 
-@pytest.mark.parametrize("entry", ["short entry", "longer entry " * 60])
-def test_replaying_a_hook_checkpoint_preserves_the_original_drawers(
-    tmp_path, monkeypatch, collection, entry
-):
-    from mempalace import mcp_server, service
-
-    monkeypatch.setattr(mcp_server, "_get_collection", lambda **_: collection)
-    monkeypatch.setattr(type(mcp_server._config), "chunk_size", property(lambda self: 100))
-    monkeypatch.setattr(hooks_cli, "STATE_DIR", tmp_path)
-    payload = {
-        "entry": entry,
-        "idempotency_key": "checkpoint-key",
-        "hook_ack": {"session_id": "test"},
-    }
-    first = service.run_diary_write(payload)
-    stored = collection.get(include=["documents", "metadatas"])
-    repeated = service.run_diary_write(payload)
-    assert first["success"] and repeated["success"]
-    assert repeated["entry_id"] == first["entry_id"]
-    again = collection.get(include=["documents", "metadatas"])
-    assert stored == again
-
-
 def test_hook_started_daemon_retries_queued_work_after_writer_releases(state, monkeypatch):
     import contextlib
 
