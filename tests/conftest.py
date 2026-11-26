@@ -611,15 +611,3 @@ def seeded_kg(kg):
     kg.add_triple("Alice", "works_at", "NewCo", valid_from="2025-01-01")
 
     return kg
-
-
-@pytest.fixture(autouse=True)
-def _daemon_mines_in_process(monkeypatch):
-    """Run daemon mine jobs on the worker thread unless a test opts in.
-
-    By default the daemon mines in a child process, which the in-process
-    fakes most daemon tests install (a patched ``execute_job``, the stable
-    test embedder above) cannot reach. Tests of the child set
-    ``MEMPALACE_DAEMON_MINE_CHILD=1`` themselves.
-    """
-    monkeypatch.setenv("MEMPALACE_DAEMON_MINE_CHILD", "0")
