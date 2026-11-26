@@ -38,6 +38,15 @@ DEFAULT_EXIT_GRACE_SECONDS = 30.0
 # embedded slice) is killed once it has burned this many multiples of the
 # stall limit in CPU-seconds: a pure-Python loop that never returns.
 CPU_STALL_FACTOR = 5.0
+# A background-priority child the reaper cannot sample (macOS taskpolicy,
+# Windows background mode, Linux nice 19, or SCHED_IDLE without /proc) may be
+# starved rather than wedged, and nothing tells the two apart. Its silence
+# limit is this multiple of the stall limit: 10 minutes by default.
+UNOBSERVED_STALL_FACTOR = 10.0
+# Priorities ``mine_child.lower_priority`` reports for a lowered child.
+_BACKGROUND_PRIORITIES = frozenset(
+    {"sched-idle", "nice-19", "taskpolicy-background", "windows-background", "windows-idle"}
+)
 
 
 def _child_env(palace_path: str, threads: int) -> dict:
@@ -342,6 +351,10 @@ def _reap_stalled(
     with flat CPU and no runnable thread is a child blocked for good (a native
     hang holding the GIL), and silence with CPU advancing is one spinning:
     both are killed.
+
+    Any other background child, and a ``SCHED_IDLE`` one the sampler cannot
+    read, gives no such signal; it is allowed ``UNOBSERVED_STALL_FACTOR``
+    times the limit instead.
     """
     tick = min(1.0, stall_seconds / 4)
     baseline = None
@@ -356,10 +369,11 @@ def _reap_stalled(
         silent = child.stalled_for(time.monotonic())
         if sample is not None and baseline is not None and sample[1] and sample[0] == baseline:
             continue  # starved by busier processes, not stuck
-        if silent > stall_seconds:
-            child.kill(
-                f"mine child sent nothing for {silent:.0f} s (stall limit {stall_seconds:g} s)"
-            )
+        limit = stall_seconds
+        if sample is None and child.priority in _BACKGROUND_PRIORITIES:
+            limit = stall_seconds * UNOBSERVED_STALL_FACTOR
+        if silent > limit:
+            child.kill(f"mine child sent nothing for {silent:.0f} s (stall limit {limit:g} s)")
             return
 
 

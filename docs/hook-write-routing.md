@@ -86,8 +86,9 @@ again. `mempalace daemon start` keeps running unless configured:
 
 ### Where a daemon mine runs
 
-The daemon is the palace's only writer. A mine job's compute (reading files,
-chunking, embedding) runs in a child process at background priority: Linux
+The daemon is the palace's only writer. With `daemon.mine_child` on (it is off
+by default for now), a mine job's compute (reading files, chunking, embedding)
+runs in a child process at background priority: Linux
 `SCHED_IDLE` (fallback `nice 19`), macOS `taskpolicy -b`, Windows background
 mode (fallback idle priority class). The child never opens the storage backend;
 each collection call it makes travels over a pipe and runs in the daemon, with
@@ -101,13 +102,19 @@ checkpoint lands between a long mine's batches instead of after it.
 The child uses 2 ONNX Runtime intra-op threads with thread spinning off:
 
     MEMPALACE_DAEMON_MINE_THREADS=2        # or daemon.mine_threads; 0 = embedding_threads
-    MEMPALACE_DAEMON_MINE_CHILD=0          # or daemon.mine_child: false; mine on the daemon thread
+    MEMPALACE_DAEMON_MINE_CHILD=1          # or daemon.mine_child: true; default off mines on the daemon thread
 
 The child sends a heartbeat every 10 s, and the daemon's reaper kills a child
 that has sent nothing for 60 s (time the daemon spends running one of its
 calls does not count), or one still running 30 s after it reported done. The
 job then fails and the daemon keeps going; writes already made stay, and the
-next mine resumes from them. `/health` reports the running child under
+next mine resumes from them.
+
+On Linux a `SCHED_IDLE` child that is silent because busier processes take
+every CPU (runnable, its CPU time flat) is not killed. Elsewhere the daemon
+cannot tell a starved child from a wedged one, so a background-priority child
+it cannot sample (macOS, Windows, Linux `nice 19`) gets ten times the stall
+limit, 10 minutes by default, before it is killed. `/health` reports the running child under
 `mine_progress` (pid, calls served, seconds since its last message).
 
     MEMPALACE_DAEMON_MINE_STALL_SECONDS=60  # or daemon.mine_stall_seconds; 0 = no reaper

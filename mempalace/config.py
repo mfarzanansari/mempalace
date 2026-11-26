@@ -1792,15 +1792,17 @@ class MempalaceConfig:
     def daemon_mine_child(self) -> bool:
         """Whether the daemon runs mine jobs in an idle-priority child process.
 
-        Env ``MEMPALACE_DAEMON_MINE_CHILD`` > config ``daemon.mine_child`` > on.
-        Off runs mines on the daemon's own worker thread, as before.
+        Env ``MEMPALACE_DAEMON_MINE_CHILD`` > config ``daemon.mine_child`` > off.
+        Off runs mines on the daemon's own worker thread, as before. Off by
+        default for now: only Linux ``SCHED_IDLE`` lets the reaper tell a
+        starved child from a wedged one.
         """
         flag = env_flag("MEMPALACE_DAEMON_MINE_CHILD")
         if flag is not None:
             return flag
-        value = self._daemon_section().get("mine_child", True)
+        value = self._daemon_section().get("mine_child", False)
         parsed = parse_bool(value) if isinstance(value, (bool, str)) else None
-        return True if parsed is None else parsed
+        return parsed is True
 
     @property
     def daemon_mine_threads(self) -> int:

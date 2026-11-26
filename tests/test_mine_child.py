@@ -510,23 +510,68 @@ _SILENT_IDLE_CHILD = textwrap.dedent(
     from mempalace import mine_child as m
     m._read_msg(sys.stdin.buffer)
     m._write_msg(sys.stdout.buffer, {"op": "started", "pid": os.getpid(),
-                                     "priority": "sched-idle"})
+                                     "priority": os.environ["CHILD_PRIORITY"]})
     time.sleep(float(os.environ["SILENT_FOR"]))
     m._write_msg(sys.stdout.buffer, {"op": "done", "result": {"success": True}})
     """
 )
 
 
-def _silent_idle(tmp_path, monkeypatch, sampler, silent_for):
+def _silent_idle(tmp_path, monkeypatch, sampler, silent_for, priority="sched-idle", stall=0.4):
     monkeypatch.setenv("SILENT_FOR", str(silent_for))
+    monkeypatch.setenv("CHILD_PRIORITY", priority)
     return run_mine_in_child(
         {},
         palace_path=str(tmp_path),
         write_lock=threading.RLock(),
         argv=_child_argv(_SILENT_IDLE_CHILD),
-        stall_seconds=0.4,
+        stall_seconds=stall,
         proc_sampler=sampler,
     )
+
+
+_NO_SIGNAL = [
+    ("nice-19", lambda pid: (100, True)),
+    ("taskpolicy-background", lambda pid: None),
+    ("windows-background", lambda pid: None),
+    ("windows-idle", lambda pid: None),
+    # SCHED_IDLE where /proc cannot be read.
+    ("sched-idle", lambda pid: None),
+]
+
+
+@pytest.mark.parametrize("priority,sampler", _NO_SIGNAL, ids=[p for p, _ in _NO_SIGNAL])
+def test_background_child_without_a_starvation_signal_gets_the_long_stall_limit(
+    tmp_path, monkeypatch, priority, sampler
+):
+    """No way to tell starved from wedged: silence past the plain stall limit
+    is not enough to kill a background-priority child."""
+    result = _silent_idle(tmp_path, monkeypatch, sampler, 1.5, priority=priority, stall=0.2)
+    assert result["success"], result
+
+
+def test_background_child_without_a_signal_is_still_reaped_past_the_long_limit(
+    tmp_path, monkeypatch
+):
+    from mempalace import mine_supervisor
+
+    monkeypatch.setattr(mine_supervisor, "UNOBSERVED_STALL_FACTOR", 3.0)
+    result = _silent_idle(tmp_path, monkeypatch, None, 60, priority="nice-19", stall=0.2)
+    assert result["error_class"] == "MineChildKilled", result
+    assert "stall limit 0.6 s" in result["error"]
+
+
+def test_default_unobserved_stall_limit_is_well_past_a_minute():
+    from mempalace import mine_supervisor
+
+    limit = mine_supervisor.UNOBSERVED_STALL_FACTOR * mine_supervisor.DEFAULT_STALL_SECONDS
+    assert limit >= 600
+
+
+def test_normal_priority_child_keeps_the_plain_stall_limit(tmp_path, monkeypatch):
+    """Not deprioritised, so not starved: the plain limit applies."""
+    result = _silent_idle(tmp_path, monkeypatch, None, 60, priority="normal", stall=0.2)
+    assert result["error_class"] == "MineChildKilled", result
 
 
 def test_starved_idle_child_survives_heartbeat_silence(tmp_path, monkeypatch):
@@ -650,3 +695,14 @@ def test_adapter_with_direct_graph_access_runs_under_daemon_write_lock(tmp_path,
     monkeypatch.setattr(service, "execute_job", execute)
     job = runtime.store.enqueue("mine", {"source_adapter": "fixture"})
     assert runtime._run_job(job, job.payload).get("writer") == os.getpid()
+
+
+def test_mine_child_is_off_by_default(tmp_path, monkeypatch):
+    """Starvation detection only works for SCHED_IDLE on Linux, so the child
+    is opt-in for now."""
+    from mempalace.config import MempalaceConfig
+
+    monkeypatch.delenv("MEMPALACE_DAEMON_MINE_CHILD", raising=False)
+    assert MempalaceConfig(config_dir=str(tmp_path)).daemon_mine_child is False
+    (tmp_path / "config.json").write_text('{"daemon": {"mine_child": true}}')
+    assert MempalaceConfig(config_dir=str(tmp_path)).daemon_mine_child is True
