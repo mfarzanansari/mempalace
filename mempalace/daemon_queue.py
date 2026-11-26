@@ -3,7 +3,7 @@
 Hooks enqueue into this queue and start the daemon from here, so this module
 must stay cheap to import: it may not import ``chromadb``, ``numpy``,
 ``onnxruntime`` or anything under ``mempalace.palace`` / ``mempalace.backends``
-(``tests/test_daemon_queue_import.py`` enforces it). ``mempalace.daemon``
+(``tests/test_daemon_autostart.py`` checks it). ``mempalace.daemon``
 re-exports every public name for existing callers.
 """
 

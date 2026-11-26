@@ -1364,11 +1364,14 @@ def _save_diary_direct(
 ) -> dict:
     """Queue a diary checkpoint without importing ``mempalace.mcp_server``.
 
-    The daemon path still waits on a job. The direct path spawns a detached
-    child (``run_detached_diary_checkpoint``) and returns immediately with
-    ``checkpoint_queued`` and ``drawers_filed`` 0. The child files the drawer,
-    writes the ack and the save marker, and then runs the transcript and
-    project mines, so the caller must not start them itself.
+    Neither path waits for the drawer. Both return at once with
+    ``checkpoint_queued`` and ``drawers_filed`` 0. The daemon path queues a
+    ``diary_write`` job; the daemon files the drawer and then writes the ack
+    and the save marker, and the caller still runs the transcript and project
+    mines. The direct path spawns a detached child
+    (``run_detached_diary_checkpoint``) that files the drawer, writes the ack
+    and the save marker, and then runs those mines itself, so the caller must
+    not start them.
 
     The entry is filed under `agent_name` so the agent that later calls
     `mempalace_diary_read(agent_name=...)` discovers it. If `wing` is
