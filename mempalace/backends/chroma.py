@@ -2341,9 +2341,15 @@ class ChromaCollection(BaseCollection):
             try:
                 yield
             finally:
-                note_write_finished(self._palace_path)
-                if self._backend is not None:
-                    self._backend._restamp(self._palace_path)
+                # The write has committed; a marker that will not clear only
+                # costs the next mine a full check, so never fail on it.
+                try:
+                    note_write_finished(self._palace_path)
+                except Exception as exc:
+                    logger.warning("Could not clear the write-in-flight marker: %s", exc)
+                finally:
+                    if self._backend is not None:
+                        self._backend._restamp(self._palace_path)
 
     # ------------------------------------------------------------------
     # Writes

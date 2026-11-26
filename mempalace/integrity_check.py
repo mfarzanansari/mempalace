@@ -193,6 +193,14 @@ def _capped(errors: list[str]) -> list[str]:
     return [*errors[:_MAX_REPORTED], f"... and {len(errors) - _MAX_REPORTED} more issue(s)"]
 
 
+def _check_failed(exc: Exception) -> list[str]:
+    # SQLITE_BUSY / SQLITE_LOCKED ("database [table|schema] is locked") mean the
+    # check could not run, not that the database is damaged.
+    if isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc):
+        return [f"{PROBE_FAILED_PREFIX}: {exc}"]
+    return [f"PRAGMA quick_check failed: {exc}"]
+
+
 def scoped_check_errors(db_path: str, ids: Optional[Iterable[str]]) -> list[str]:
     """Scan the rows written for ``ids`` and quick_check the tables writes touch.
 
@@ -210,7 +218,7 @@ def scoped_check_errors(db_path: str, ids: Optional[Iterable[str]]) -> list[str]
                 errors = [e for table in SCOPED_TABLES for e in _quick_check(conn, table)]
             errors += _scan_written_rows(conn, sorted(set(ids)))
     except (sqlite3.Error, ValueError) as exc:
-        return [f"PRAGMA quick_check failed: {exc}"]
+        return _check_failed(exc)
     return _capped(errors)
 
 
@@ -220,7 +228,7 @@ def full_check_errors(db_path: str) -> list[str]:
         with closing(_connect(db_path)) as conn:
             return _capped(_quick_check(conn))
     except (sqlite3.Error, ValueError) as exc:
-        return [f"PRAGMA quick_check failed: {exc}"]
+        return _check_failed(exc)
 
 
 def _child_main() -> None:  # pragma: no cover - runs in the child; see run_probe
@@ -712,6 +720,7 @@ def run_full_check(palace_path: str, *, force: bool = False) -> FullCheckOutcome
             errors=("chroma.sqlite3 resolves to a named pipe, not a database",), cached=False
         )
     record = _load_record(palace_path)
+    # Unlocked: a live write elsewhere reads as unclean; costs a full check, never a wrong "clean".
     if not force and not unclean_exit_seen(palace_path) and _cached_clean(record, palace_path):
         return FullCheckOutcome(errors=(), cached=True, checked_at=record.get("checked_at"))
     started, fingerprint = time.time(), db_fingerprint(palace_path)

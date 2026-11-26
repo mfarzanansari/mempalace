@@ -256,6 +256,88 @@ def test_chroma_writes_hold_the_in_flight_marker_only_while_writing(tmp_path, mo
     assert not marker.exists()
 
 
+def _failing_marker_rename(monkeypatch):
+    """Make the end-of-write marker rename fail, as it can on Windows."""
+    from mempalace import integrity_check as ic
+
+    def _boom(*args, **kwargs):
+        raise PermissionError("rename refused")
+
+    monkeypatch.setattr(ic, "replace_with_retry", _boom)
+
+
+def test_a_failed_marker_rename_does_not_fail_a_committed_write(tmp_path, monkeypatch):
+    palace = _palace_with(tmp_path, [("a", "hello")])
+    backend = ChromaBackend()
+    try:
+        col = backend.get_collection(str(palace), "mempalace_drawers")
+        restamps = []
+        real_restamp = backend._restamp
+        monkeypatch.setattr(
+            backend, "_restamp", lambda path: (restamps.append(path), real_restamp(path))
+        )
+        _failing_marker_rename(monkeypatch)
+        col.upsert(ids=["b"], documents=["two"], metadatas=[{"wing": "w"}])
+        assert col.get(ids=["b"]).documents == ["two"]
+        assert restamps == [str(palace)]
+    finally:
+        backend.close()
+
+
+def test_a_failed_marker_rename_keeps_the_write_error(tmp_path, monkeypatch):
+    palace = _palace_with(tmp_path, [("a", "hello")])
+    backend = ChromaBackend()
+    try:
+        col = backend.get_collection(str(palace), "mempalace_drawers")
+        restamps = []
+        monkeypatch.setattr(backend, "_restamp", restamps.append)
+
+        def _fail(**kwargs):
+            raise RuntimeError("the write itself failed")
+
+        monkeypatch.setattr(col._collection, "upsert", _fail)
+        _failing_marker_rename(monkeypatch)
+        with pytest.raises(RuntimeError, match="the write itself failed"):
+            col.upsert(ids=["b"], documents=["two"], metadatas=[{"wing": "w"}])
+        assert restamps == [str(palace)]
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize("check", ["scoped", "full"])
+@pytest.mark.parametrize("message", ["database is locked", "database table is locked"])
+def test_a_busy_database_is_reported_as_not_verified(tmp_path, monkeypatch, check, message):
+    import sqlite3
+
+    from mempalace import integrity_check as ic
+
+    def _locked(db_path):
+        raise sqlite3.OperationalError(message)
+
+    monkeypatch.setattr(ic, "_connect", _locked)
+    db = str(tmp_path / "chroma.sqlite3")
+    errors = ic.scoped_check_errors(db, {"a"}) if check == "scoped" else ic.full_check_errors(db)
+    assert len(errors) == 1 and errors[0].startswith(ic.PROBE_FAILED_PREFIX)
+    assert message in errors[0]
+    assert ic.all_unverified(errors)
+
+
+@pytest.mark.parametrize("check", ["scoped", "full"])
+def test_a_malformed_database_is_still_reported_as_damage(tmp_path, monkeypatch, check):
+    import sqlite3
+
+    from mempalace import integrity_check as ic
+
+    def _malformed(db_path):
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    monkeypatch.setattr(ic, "_connect", _malformed)
+    db = str(tmp_path / "chroma.sqlite3")
+    errors = ic.scoped_check_errors(db, {"a"}) if check == "scoped" else ic.full_check_errors(db)
+    assert errors == ["PRAGMA quick_check failed: database disk image is malformed"]
+    assert not ic.all_unverified(errors)
+
+
 # ── 4. The post-mine validator, with a real child process ───────────
 
 
