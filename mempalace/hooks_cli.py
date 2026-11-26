@@ -669,18 +669,27 @@ def _daemon_available() -> bool:
 def _daemon_can_start() -> bool:
     """Whether this hook may start a daemon.
 
-    Auto-start must be on, no daemon registered alive, and no daemon refused
-    to start in the last minute because another process owns the palace's
-    writer lock -- starting one would only refuse again, so ``prefer`` takes
-    its direct path instead of queuing work nothing will run.
+    Auto-start must be on, no daemon registered alive, no other process
+    holding the palace's writer lock right now, and no daemon refused to start
+    in the last minute for that reason. A daemon started then would only
+    refuse, so ``prefer`` takes its direct path instead of queuing work
+    nothing will run (and a later direct save filing it a second time).
     """
     if not _daemon_autostart_enabled():
         return False
-    from .daemon_queue import daemon_registered_alive, start_recently_refused
+    from .daemon_queue import (
+        daemon_registered_alive,
+        palace_writer_lock_held,
+        start_recently_refused,
+    )
 
     try:
         palace = MempalaceConfig().palace_path
-        return not daemon_registered_alive(palace) and not start_recently_refused(palace)
+        return (
+            not daemon_registered_alive(palace)
+            and not start_recently_refused(palace)
+            and not palace_writer_lock_held(palace)
+        )
     except Exception:
         return False
 
@@ -690,10 +699,9 @@ def _daemon_autostart_enabled() -> bool:
 
     Only consulted under ``prefer``/``require``: the default ``direct`` policy
     never probes or starts a daemon, so daemon mode stays opt-in. Within an
-    opted-in policy the hook starts the daemon detached and returns at once;
-    set ``hooks.daemon_autostart: false`` (or
-    ``MEMPALACE_HOOK_DAEMON_AUTOSTART=0``) for installs that supervise the
-    daemon themselves.
+    opted-in policy the hook starts the daemon detached and returns at once,
+    but only with ``hooks.daemon_autostart: true`` (or
+    ``MEMPALACE_HOOK_DAEMON_AUTOSTART=1``); it is off by default.
     """
     try:
         return MempalaceConfig().hook_daemon_autostart

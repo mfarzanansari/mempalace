@@ -1019,6 +1019,46 @@ def daemon_registered_alive(palace_path: str) -> bool:
     return daemon_lock_held(palace_path)
 
 
+def _palace_writer_lock_paths(palace_path: str) -> list[str]:
+    """The lock files ``mine_palace_lock`` takes, computed without importing it.
+
+    Keep in step with ``palace_lock._palace_side_lock_path`` and the
+    ``mine_palace_<key>.lock`` name there; a test checks they match.
+    """
+    found = [
+        os.path.join(
+            paths.lock_dir(), f"mine_palace_{paths.palace_key(palace_path, length=16)}.lock"
+        )
+    ]
+    parent, name = os.path.split(paths.canonical_palace_path(palace_path))
+    if name:
+        found.append(os.path.join(parent, f".{name}.mempalace.lock"))
+    return found
+
+
+def palace_writer_lock_held(palace_path: str) -> bool:
+    """Whether some process holds the palace's writer lock right now.
+
+    Probes each lock file without waiting and drops it at once. A missing
+    file, or one that is not a regular file, counts as free.
+    """
+    import stat
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    for path in _palace_writer_lock_paths(palace_path):
+        try:
+            fd = os.open(path, flags | getattr(os, "O_BINARY", 0))
+        except OSError:
+            continue
+        with os.fdopen(fd, "rb", buffering=0) as fh:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                continue
+            if not _try_lock_nonblocking(fh):
+                return True
+            _unlock(fh)
+    return False
+
+
 # Written by a daemon that could not take the palace's writer lock (another
 # writer owns a single-writer backend). Hooks stop starting daemons that would
 # only refuse again, and ``prefer`` falls back to its direct path.

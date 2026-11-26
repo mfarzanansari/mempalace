@@ -75,6 +75,7 @@ def test_hook_daemon_enqueue_imports_no_storage_stack_and_fits_the_budget(tmp_pa
         env={
             "MEMPALACE_PALACE_PATH": str(palace),
             "MEMPALACE_HOOK_WRITE_ROUTING": "prefer",
+            "MEMPALACE_HOOK_DAEMON_AUTOSTART": "1",
             daemon_queue.STATE_ROOT_ENV: str(state_root),
             "HOME": str(tmp_path / "home"),
         },
@@ -131,7 +132,7 @@ def test_default_policy_never_starts_a_daemon(tmp_path, monkeypatch):
     ):
         monkeypatch.delenv(key, raising=False)
     cfg = MempalaceConfig(config_dir=str(tmp_path))
-    assert cfg.hook_daemon_autostart is True
+    assert cfg.hook_daemon_autostart is False
     monkeypatch.setattr(hooks_cli, "MempalaceConfig", lambda: cfg)
     with patch.object(hooks_cli, "_daemon_available") as probe:
         decision = hooks_cli._compute_hook_write_routing().decision
@@ -313,6 +314,92 @@ def test_a_refused_daemon_start_stops_hooks_from_starting_more(state, monkeypatc
     assert hooks_cli._daemon_can_start() is False
     daemon_queue.clear_start_refused(state)
     assert hooks_cli._daemon_can_start() is True
+
+
+def test_autostart_is_off_by_default(tmp_path, monkeypatch):
+    """An auto-started daemon holds the palace writer lock for its whole life,
+    so starting one must be an explicit choice."""
+    from mempalace.config import MempalaceConfig
+
+    monkeypatch.delenv("MEMPALACE_HOOK_DAEMON_AUTOSTART", raising=False)
+    assert MempalaceConfig(config_dir=str(tmp_path)).hook_daemon_autostart is False
+
+
+@pytest.mark.parametrize("autostart,spawns", [(None, 0), ("0", 0), ("1", 1)])
+def test_legacy_hooks_daemon_starts_a_daemon_at_session_start_only_when_asked(
+    tmp_path, monkeypatch, state, autostart, spawns
+):
+    from mempalace.config import MempalaceConfig
+
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "config.json").write_text(
+        json.dumps({"palace_path": state, "hooks": {"daemon": True}})
+    )
+    for key in (
+        "MEMPALACE_HOOK_WRITE_ROUTING",
+        "MEMPALACE_WRITE_ROUTING",
+        "MEMPALACE_HOOKS_DAEMON",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    if autostart is None:
+        monkeypatch.delenv("MEMPALACE_HOOK_DAEMON_AUTOSTART", raising=False)
+    else:
+        monkeypatch.setenv("MEMPALACE_HOOK_DAEMON_AUTOSTART", autostart)
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", state)
+    monkeypatch.setattr(
+        hooks_cli, "MempalaceConfig", lambda: MempalaceConfig(config_dir=str(config_dir))
+    )
+    monkeypatch.setattr(hooks_cli, "_palace_root_exists", lambda: True)
+    monkeypatch.setattr(hooks_cli, "STATE_DIR", tmp_path / "hook_state")
+    monkeypatch.setattr(hooks_cli, "_daemon_available", lambda: False)
+    monkeypatch.setattr(hooks_cli, "_output", lambda _out: None)
+    spawned = []
+    monkeypatch.setattr(daemon_queue, "spawn_daemon_detached", lambda p, **_: spawned.append(p))
+    hooks_cli.hook_session_start({"session_id": "s1"}, "claude-code")
+    assert len(spawned) == spawns
+
+
+def test_writer_lock_probe_checks_the_files_mine_palace_lock_takes(state):
+    from mempalace import palace, paths
+
+    expected = {
+        palace._palace_side_lock_path(state),
+        os.path.join(paths.lock_dir(), f"mine_palace_{paths.palace_key(state, length=16)}.lock"),
+    }
+    assert set(daemon_queue._palace_writer_lock_paths(state)) == expected
+
+
+def test_no_daemon_start_while_another_writer_holds_the_palace_lock(state, monkeypatch):
+    """A writer (MCP server, manual mine) holding the palace lock would refuse
+    the daemon. The hook must not commit a job nothing will run, or the direct
+    fallback of a later hook files the same checkpoint twice."""
+    from mempalace.palace import mine_palace_lock
+
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", state)
+    monkeypatch.setenv("MEMPALACE_HOOK_DAEMON_AUTOSTART", "1")
+    assert hooks_cli._daemon_can_start() is True
+    with mine_palace_lock(state):
+        assert daemon_queue.palace_writer_lock_held(state) is True
+        assert hooks_cli._daemon_can_start() is False
+    assert daemon_queue.palace_writer_lock_held(state) is False
+    assert hooks_cli._daemon_can_start() is True
+
+
+@pytest.mark.parametrize(
+    "policy,target",
+    [(WriteRoutingPolicy.PREFER, "direct"), (WriteRoutingPolicy.REQUIRE, "blocked")],
+)
+def test_held_palace_lock_routes_the_hook_away_from_the_queue(state, monkeypatch, policy, target):
+    from mempalace.palace import mine_palace_lock
+
+    cfg = _Cfg(policy, autostart=True)
+    cfg.palace_path = state
+    monkeypatch.setattr(hooks_cli, "MempalaceConfig", lambda: cfg)
+    monkeypatch.setattr(hooks_cli, "_daemon_available", lambda: False)
+    with mine_palace_lock(state):
+        decision = hooks_cli._compute_hook_write_routing().decision
+    assert (decision.target.value, decision.auto_start_daemon) == (target, False)
 
 
 def test_run_server_records_a_refused_start(state, monkeypatch):

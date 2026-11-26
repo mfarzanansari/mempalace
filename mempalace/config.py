@@ -1773,15 +1773,16 @@ class MempalaceConfig:
         Consulted only when hook write routing is ``prefer`` or ``require``;
         the default ``direct`` policy never touches the daemon. Env
         ``MEMPALACE_HOOK_DAEMON_AUTOSTART`` > config ``hooks.daemon_autostart``
-        > on. Turn it off for installs that supervise the daemon themselves.
+        > off. Off by default: a started daemon holds the palace writer lock
+        until it exits idle, which refuses MCP writes and manual mines.
         """
         flag = env_flag("MEMPALACE_HOOK_DAEMON_AUTOSTART")
         if flag is not None:
             return flag
         hooks = self._file_config.get("hooks", {})
-        value = hooks.get("daemon_autostart", True) if isinstance(hooks, dict) else True
+        value = hooks.get("daemon_autostart", False) if isinstance(hooks, dict) else False
         parsed = parse_bool(value) if isinstance(value, (bool, str)) else None
-        return True if parsed is None else parsed
+        return parsed is True
 
     def _daemon_section(self) -> dict:
         daemon = self._file_config.get("daemon", {})
