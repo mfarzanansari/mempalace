@@ -173,6 +173,46 @@ def test_backend_open_inside_child_is_refused():
     assert out.stdout.strip() == "refused"
 
 
+_CHILD_WRITERS = {
+    "mempalace.palace:_validate_palace_fts5_after_mine": ("/nonexistent",),
+    "mempalace.cli:_run_pass_zero": ("/nonexistent", "/nonexistent-palace", None),
+    "mempalace.revisions:append_drawer_revisions": ("/nonexistent", []),
+    "mempalace.miner:_compute_topic_tunnels_for_wing": ("w",),
+    "mempalace.miner:_compute_entity_tunnels_for_wing": ("w",),
+    "mempalace.hallways:_store_wing_hallways": ("w", [], {}, {}, 1),
+}
+
+
+@pytest.mark.parametrize("target", sorted(_CHILD_WRITERS))
+def test_original_writer_held_elsewhere_is_refused_inside_child(target):
+    """The identity sweep rebinds module globals only. A reference it cannot
+    reach (kept in a closure, a default argument, a callback table) must not
+    write the palace from the child."""
+    module, name = target.split(":")
+    kwargs = {"config": None} if name == "_store_wing_hallways" else {}
+    script = textwrap.dedent(
+        f"""
+        import importlib, sys
+        held = {{"fn": getattr(importlib.import_module({module!r}), {name!r})}}
+        from mempalace import mine_child
+        mine_child._install_remote_storage()
+        try:
+            held["fn"](*{_CHILD_WRITERS[target]!r}, **{kwargs!r})
+        except mine_child.ChildWriterViolation as exc:
+            print("refused", {name!r} in str(exc), file=sys.__stdout__)
+        except Exception as exc:
+            print("ran", type(exc).__name__, file=sys.__stdout__)
+        else:
+            print("ran", file=sys.__stdout__)
+        """
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=120
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip().splitlines()[-1] == "refused True"
+
+
 def _wait_for(predicate, timeout=30.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:

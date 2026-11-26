@@ -291,6 +291,19 @@ def _remote_collection_class():
     return remote_cls, remote_iter_cls
 
 
+def _refused_in_child(*args, **kwargs):
+    # Runs with the poisoned function's globals, so it names nothing from here.
+    raise __import__("mempalace.mine_child", fromlist=["_"]).ChildWriterViolation(
+        f"{__import__('sys')._getframe().f_code.co_name} called inside the mine child; "
+        "every storage write must go through the daemon"
+    )
+
+
+def _refuse_when_called(fn) -> None:
+    """Make ``fn`` itself raise ChildWriterViolation, wherever it is referenced."""
+    fn.__code__ = _refused_in_child.__code__.replace(co_name=fn.__name__)
+
+
 def _install_remote_storage() -> None:
     """Route every collection open to the daemon; forbid opening a backend here."""
     import importlib
@@ -342,19 +355,24 @@ def _install_remote_storage() -> None:
             {"op": "store_hallways", "args": (wing, file_keys, pair_counts, pair_rooms, min_count)}
         )
 
+    cli_run_pass_zero = cli._run_pass_zero
+    hallways_store = hallways._store_wing_hallways
+    revisions_append = revisions.append_drawer_revisions
+    topic_tunnels = miner._compute_topic_tunnels_for_wing
+    entity_tunnels = miner._compute_entity_tunnels_for_wing
     replacements = {
         original_get_collection: get_collection,
-        cli._run_pass_zero: lambda project_dir, palace_dir, llm_provider: _CHANNEL.request(
+        cli_run_pass_zero: lambda project_dir, palace_dir, llm_provider: _CHANNEL.request(
             {"op": "redetect_origin", "source": project_dir}
         ),
-        hallways._store_wing_hallways: store_hallways,
-        revisions.append_drawer_revisions: lambda palace_path, revisions: _CHANNEL.request(
+        hallways_store: store_hallways,
+        revisions_append: lambda palace_path, revisions: _CHANNEL.request(
             {"op": "revisions", "rows": list(revisions)}
         ),
-        miner._compute_topic_tunnels_for_wing: lambda wing, config=None: _CHANNEL.request(
+        topic_tunnels: lambda wing, config=None: _CHANNEL.request(
             {"op": "topic_tunnels", "wing": wing}
         ),
-        miner._compute_entity_tunnels_for_wing: lambda wing, config=None: _CHANNEL.request(
+        entity_tunnels: lambda wing, config=None: _CHANNEL.request(
             {"op": "entity_tunnels", "wing": wing}
         ),
         embedding_wrapper._embed_texts: _sliced_embedder(embedding_wrapper._embed_texts),
@@ -373,6 +391,20 @@ def _install_remote_storage() -> None:
                 continue
             if replacement is not None:
                 setattr(module, attr, replacement)
+
+    # The sweep only rebinds module attributes. A reference kept anywhere else
+    # (a closure, a default argument, a callback table) would still run the
+    # original and write the palace from this process, so the originals of
+    # the writers above now refuse, as a direct backend open does below.
+    for original in (
+        original_validate,
+        cli_run_pass_zero,
+        hallways_store,
+        revisions_append,
+        topic_tunnels,
+        entity_tunnels,
+    ):
+        _refuse_when_called(original)
 
     def _forbidden(self, *a, **kw):
         raise ChildWriterViolation(
